@@ -447,18 +447,29 @@ export PEERTUBE_REDIS_HOSTNAME=127.0.0.1
 export PEERTUBE_REDIS_PORT=6379
 export PEERTUBE_REDIS_AUTH="$REDIS_PASSWORD"
 
-# PeerTube runs on 9001; the Caddy sidecar listens on 9000
-# (the port openhost.toml advertises) and rewrites the Host
-# header before forwarding to PeerTube. PeerTube's
-# /api/v1/oauth-clients/local handler hard-rejects requests
-# whose Host doesn't match webserver.hostname[:port], and the
-# OpenHost router strips Host before proxying — so we have to
-# reconstitute it from X-Forwarded-Host. See ./Caddyfile.
+# PeerTube runs on 9001 internally; Caddy on 9000 fronts it
+# and rewrites the Host header (see ./Caddyfile and the
+# README.md "Why Caddy" section).
 #
-# We leave PEERTUBE_LISTEN_HOSTNAME at the upstream default
-# (0.0.0.0) — Caddy on 127.0.0.1:9000 is the only reachable
-# entry point because openhost.toml advertises only 9000.
-export PEERTUBE_LISTEN_PORT=9001
+# The v7.3.0 production image's custom-environment-variables.yaml
+# does NOT map PEERTUBE_LISTEN_PORT — that mapping was added on
+# the develop branch but is not in any released tag. So we have
+# to write a small per-boot YAML override into the
+# $PEERTUBE_LOCAL_CONFIG=/config directory which node-config
+# layers on top of the production.yaml. The directory is set
+# via the upstream Dockerfile's
+#   ENV NODE_CONFIG_DIR /app/config:/app/support/docker/production/config:/config
+# so anything we drop in /config wins.
+LOCAL_CONFIG_DIR=/config
+mkdir -p "$LOCAL_CONFIG_DIR"
+chown peertube:peertube "$LOCAL_CONFIG_DIR"
+cat > "$LOCAL_CONFIG_DIR/local.yaml" <<'EOF'
+listen:
+  hostname: 127.0.0.1
+  port: 9001
+EOF
+chown peertube:peertube "$LOCAL_CONFIG_DIR/local.yaml"
+chmod 644 "$LOCAL_CONFIG_DIR/local.yaml"
 
 export PEERTUBE_WEBSERVER_HOSTNAME="$PT_HOSTNAME"
 export PEERTUBE_WEBSERVER_PORT="$PT_PORT"
@@ -554,9 +565,6 @@ chown -R peertube:peertube \
 # upload buffering; PeerTube's own docs recommend 1500 MiB on a
 # 2 GiB host.
 log "Starting PeerTube on $PT_HOSTNAME (loopback :9001)"
-log "DEBUG: PEERTUBE_LISTEN_PORT=$PEERTUBE_LISTEN_PORT"
-log "DEBUG: PEERTUBE_WEBSERVER_HOSTNAME=$PEERTUBE_WEBSERVER_HOSTNAME"
-log "DEBUG: PEERTUBE_WEBSERVER_PORT=$PEERTUBE_WEBSERVER_PORT"
 cd /app
 gosu peertube node --max-old-space-size=1500 dist/server &
 PEERTUBE_PID=$!
