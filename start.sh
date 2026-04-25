@@ -454,7 +454,10 @@ export PEERTUBE_REDIS_AUTH="$REDIS_PASSWORD"
 # whose Host doesn't match webserver.hostname[:port], and the
 # OpenHost router strips Host before proxying — so we have to
 # reconstitute it from X-Forwarded-Host. See ./Caddyfile.
-export PEERTUBE_LISTEN_HOSTNAME=127.0.0.1
+#
+# We leave PEERTUBE_LISTEN_HOSTNAME at the upstream default
+# (0.0.0.0) — Caddy on 127.0.0.1:9000 is the only reachable
+# entry point because openhost.toml advertises only 9000.
 export PEERTUBE_LISTEN_PORT=9001
 
 export PEERTUBE_WEBSERVER_HOSTNAME="$PT_HOSTNAME"
@@ -555,17 +558,37 @@ cd /app
 gosu peertube node --max-old-space-size=1500 dist/server &
 PEERTUBE_PID=$!
 
-# Make sure node actually exec'd. If `gosu` or `node` failed
-# during startup (e.g. dist/server missing, peertube user not
-# present), $PEERTUBE_PID points at a process that is already
-# dead; without this check, `wait -n` later would just see it
-# exit immediately with no diagnostic about which child died.
-sleep 1
-if ! kill -0 "$PEERTUBE_PID" 2>/dev/null; then
-    log "FATAL: PeerTube node process exited before supervisor started"
+# Wait for PeerTube to start listening on its loopback port
+# before we put Caddy in front of it. Caddy bootstraps in
+# ~100ms and the OpenHost router begins health-checking
+# immediately; if Caddy is up but PeerTube isn't, the router
+# sees 502s and may give up before PeerTube has finished
+# its initial DB migrate + Sequelize sync (which can take
+# 30-60s on first boot).
+log "Waiting for PeerTube to listen on 127.0.0.1:9001"
+PT_READY=0
+for _ in $(seq 1 120); do
+    if ! kill -0 "$PEERTUBE_PID" 2>/dev/null; then
+        log "FATAL: PeerTube node process exited during startup"
+        early_exit_teardown
+        exit 1
+    fi
+    # /dev/tcp is a bash builtin: opens a TCP probe and exits 0
+    # if the connect handshake completes. Avoids depending on
+    # `nc` which isn't always installed.
+    if (echo > /dev/tcp/127.0.0.1/9001) 2>/dev/null; then
+        PT_READY=1
+        break
+    fi
+    sleep 1
+done
+if [[ "$PT_READY" -ne 1 ]]; then
+    log "FATAL: PeerTube didn't bind 127.0.0.1:9001 within 120s"
+    kill -TERM "$PEERTUBE_PID" 2>/dev/null || true
     early_exit_teardown
     exit 1
 fi
+log "PeerTube is listening; bringing up Caddy"
 
 # -----------------------------------------------------------------
 # Start Caddy (host-rewriter front-door)
@@ -582,9 +605,20 @@ fi
 # a `caddy` system user we could use, but `nobody` is universal
 # and Caddy doesn't need persistent state for this config.
 log "Starting Caddy host-rewriter on :9000 -> :9001"
-runuser -u nobody -- caddy run \
-    --config /opt/openhost-peertube/Caddyfile \
-    --adapter caddyfile &
+# Caddy uses XDG_CONFIG_HOME / XDG_DATA_HOME to find a writable
+# directory for autosave state. Under `runuser -u nobody` the
+# default points at /nonexistent which (correctly) doesn't
+# exist. Point both at $TEMP — Caddy needs neither for our
+# stateless reverse-proxy config but logs a noisy error every
+# boot otherwise.
+CADDY_HOME="$TEMP/caddy-home"
+mkdir -p "$CADDY_HOME"
+chmod 1777 "$CADDY_HOME"
+XDG_CONFIG_HOME="$CADDY_HOME" XDG_DATA_HOME="$CADDY_HOME" \
+    HOME="$CADDY_HOME" \
+    runuser -u nobody --preserve-environment -- caddy run \
+        --config /opt/openhost-peertube/Caddyfile \
+        --adapter caddyfile &
 CADDY_PID=$!
 
 # Caddy startup is fast (~100ms) but give it a moment to bind
