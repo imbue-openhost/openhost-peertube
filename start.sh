@@ -656,6 +656,17 @@ wait -n "$PEERTUBE_PID" "$REDIS_PID" "$CADDY_PID"
 EXIT_CODE=$?
 set -e
 
-log "Child exited (code=$EXIT_CODE); shutting down container"
+# Identify which child died for diagnostics. By the time we get
+# here at least one of the three pids is gone; the others may
+# still be alive (the supervisor will TERM them in teardown).
+DEAD=""
+for tag_pid in "peertube=$PEERTUBE_PID" "redis=$REDIS_PID" "caddy=$CADDY_PID"; do
+    tag="${tag_pid%%=*}"
+    pid="${tag_pid##*=}"
+    if ! kill -0 "$pid" 2>/dev/null; then
+        DEAD="${DEAD:+$DEAD,}$tag"
+    fi
+done
+log "Child exited (code=$EXIT_CODE, dead=${DEAD:-unknown}); shutting down container"
 teardown
 exit "$EXIT_CODE"
