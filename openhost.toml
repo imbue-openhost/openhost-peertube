@@ -5,9 +5,10 @@ description = "PeerTube federated video platform: Postgres + Redis + PeerTube + 
 
 [runtime.container]
 image = "Dockerfile"
-# PeerTube listens on 9000 inside the container. The OpenHost
-# router proxies https://peertube.<zone>/... to 127.0.0.1:9000
-# and PeerTube reads PEERTUBE_TRUST_PROXY=['127.0.0.1','loopback']
+# Container port 9000 is the Caddy host-rewriter front-door —
+# Caddy fixes up the Host header (which the OpenHost router
+# strips) and proxies onward to PeerTube on loopback :9001.
+# PeerTube reads PEERTUBE_TRUST_PROXY=['127.0.0.1','loopback']
 # (set in start.sh) so it honours the X-Forwarded-* headers the
 # router stamps onto the request.
 port = 9000

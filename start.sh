@@ -373,17 +373,23 @@ stop_postgres() {
         2>/dev/null || true
 }
 
-# Helper used by the two early-exit code paths below (Redis
-# never came up, PeerTube never started). Mirrors the eventual
+# Helper used by all the early-exit code paths below (Redis,
+# PeerTube, or Caddy never came up). Mirrors the eventual
 # `teardown` function used by the supervisor proper. Defined
 # here because it's referenced by the readiness-check failure
 # branches; the supervisor `teardown` is defined later because
-# it depends on $PEERTUBE_PID and $PG_WATCHER_PID which don't
-# exist yet at this point.
+# it depends on $PG_WATCHER_PID which doesn't exist yet.
+#
+# Each child PID is checked-then-killed if set, so callers
+# don't need to know which children have started by the time
+# they hit a failure. Variables not yet assigned are absorbed
+# by `${...:-}` so `set -u` doesn't trip.
 early_exit_teardown() {
-    if [[ -n "${REDIS_PID:-}" ]]; then
-        kill -TERM "$REDIS_PID" 2>/dev/null || true
-    fi
+    for child in "${PEERTUBE_PID:-}" "${REDIS_PID:-}" "${CADDY_PID:-}"; do
+        if [[ -n "$child" ]]; then
+            kill -TERM "$child" 2>/dev/null || true
+        fi
+    done
     # Postgres outlives this start.sh as an orphan daemon
     # otherwise (the container runtime would eventually reap
     # it, but stopping it here flushes WAL).
@@ -595,7 +601,6 @@ for _ in $(seq 1 120); do
 done
 if [[ "$PT_READY" -ne 1 ]]; then
     log "FATAL: PeerTube didn't bind 127.0.0.1:9001 within 120s"
-    kill -TERM "$PEERTUBE_PID" 2>/dev/null || true
     early_exit_teardown
     exit 1
 fi
@@ -639,7 +644,6 @@ CADDY_PID=$!
 sleep 1
 if ! kill -0 "$CADDY_PID" 2>/dev/null; then
     log "FATAL: Caddy exited before supervisor started"
-    kill -TERM "$PEERTUBE_PID" 2>/dev/null || true
     early_exit_teardown
     exit 1
 fi

@@ -85,7 +85,9 @@ COPY Caddyfile /opt/openhost-peertube/Caddyfile
 RUN chmod +x /opt/openhost-peertube/start.sh
 
 # OpenHost will route http://peertube.<zone>/... to this port.
-# PeerTube listens on 9000 by default; we keep that.
+# Caddy (the host-rewriter front-door) binds :9000; PeerTube
+# itself listens on the loopback at :9001. See Caddyfile and
+# the start.sh /config/local.yaml override.
 EXPOSE 9000
 
 # ENTRYPOINT inherited from the base image is the upstream
