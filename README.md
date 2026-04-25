@@ -118,10 +118,13 @@ cat /data/app_data/peertube/admin-password.txt
 ```
 
 (In the OpenHost dashboard's terminal-into-app feature, that path is
-exactly where the file lives.) On first boot, the start script logs the
+exactly where the file lives.) On first boot, our start script logs the
 **path** to the password file — `[openhost-peertube] Initial root admin
-password is in /data/app_data/peertube/admin-password.txt` — so the
-password value is never written to the container log stream.
+password is in /data/app_data/peertube/admin-password.txt`. PeerTube's
+upstream installer separately logs the **value** of the password to
+stdout once during the very first boot only (`info: User password:
+...`), so it appears in `/app_logs/peertube` until the log rolls over.
+Treat the in-host log as sensitive on first boot.
 
 To reset the password later, exec into the container and run:
 
