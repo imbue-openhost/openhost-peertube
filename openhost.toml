@@ -1,0 +1,43 @@
+[app]
+name = "peertube"
+version = "0.1.0"
+description = "PeerTube federated video platform: Postgres + Redis + PeerTube + ffmpeg in one container"
+
+[runtime.container]
+image = "Dockerfile"
+# PeerTube listens on 9000 inside the container. The OpenHost
+# router proxies https://peertube.<zone>/... to 127.0.0.1:9000
+# and PeerTube reads PEERTUBE_TRUST_PROXY=['127.0.0.1','loopback']
+# (set in start.sh) so it honours the X-Forwarded-* headers the
+# router stamps onto the request.
+port = 9000
+
+[routing]
+health_check = "/api/v1/ping"
+# PeerTube federates over ActivityPub: every endpoint must be
+# reachable without an OpenHost auth gate or remote instances
+# can't fetch our actor objects, video metadata, or comments.
+# Login is enforced inside PeerTube itself.
+public_paths = ["/"]
+
+[resources]
+# Headroom budget at idle:
+#   * postgres ~300 MiB  (start.sh writes shared_buffers = 256 MB)
+#   * redis    ~80  MiB  (maxmemory 256 MB cap, idle around 80)
+#   * peertube ~600 MiB  (node 22 + queue workers)
+#   * ffmpeg   spikes during transcode jobs
+# 2 GiB is enough for a small instance with light transcoding;
+# bump for heavy use.
+memory_mb = 2048
+# Transcoding is CPU-bound. 2000m allows two parallel ffmpeg
+# encoding threads without starving the node event loop.
+cpu_millicores = 2000
+
+[data]
+# Persistent: Postgres data dir, Redis AOF/RDB, video files,
+# thumbnails, captions, plugin configs, generated secrets.
+app_data = true
+# Scratch: temp upload dirs, transcoding work files. These are
+# safe to lose on container restart and fill up fast during
+# upload; keeping them off the persistent disk is intentional.
+app_temp_data = true

@@ -1,0 +1,613 @@
+#!/bin/bash
+# OpenHost-side bootstrap for PeerTube.
+#
+# Layout:
+#   $OPENHOST_APP_DATA_DIR/
+#     postgres/                  -- PGDATA (initdb on first boot)
+#     redis/                     -- redis appendonly + RDB snapshots
+#     peertube-data/             -- /data inside PeerTube (videos,
+#                                   thumbnails, plugins, etc.)
+#     secrets/db_password        -- generated on first boot
+#     secrets/peertube_secret    -- generated on first boot
+#     secrets/redis_password     -- generated on first boot
+#     admin-password.txt         -- root admin password, generated
+#                                   on first boot, surfaced for
+#                                   the operator
+#     hostname                   -- cached canonical webserver
+#                                   hostname; written once and
+#                                   never overwritten because
+#                                   PeerTube's federation identity
+#                                   is permanent at the first
+#                                   recorded hostname
+#
+# We configure PeerTube entirely via PEERTUBE_* env vars rather
+# than writing a production.yaml — the upstream image already
+# loads its base config from
+# /app/support/docker/production/config/production.yaml and the
+# adjacent custom-environment-variables.yaml provides env-var
+# overrides for every key we care about.
+#
+# We use `wait -n` so a single failed child takes the whole
+# container down and OpenHost notices and restarts us. That
+# requires bash, not /bin/sh.
+
+set -euo pipefail
+
+log() { echo "[openhost-peertube] $*" >&2; }
+
+PERSIST="${OPENHOST_APP_DATA_DIR:-/data/app_data/peertube}"
+TEMP="${OPENHOST_APP_TEMP_DIR:-/data/app_temp_data/peertube}"
+
+PG_DATA="$PERSIST/postgres"
+REDIS_DIR="$PERSIST/redis"
+PEERTUBE_DATA_DIR="$PERSIST/peertube-data"
+SECRETS_DIR="$PERSIST/secrets"
+
+mkdir -p "$PERSIST" "$TEMP" \
+         "$PEERTUBE_DATA_DIR" \
+         "$SECRETS_DIR" "$REDIS_DIR"
+
+chmod 700 "$SECRETS_DIR"
+
+# -----------------------------------------------------------------
+# Resolve canonical hostname
+# -----------------------------------------------------------------
+# PeerTube embeds the canonical hostname into ActivityPub object
+# IDs and into the URLs of every uploaded video. Once the database
+# is seeded with a hostname, changing it later breaks federation
+# (remote instances can't dereference the old IDs) and breaks
+# every existing video URL. So: write the hostname once and keep
+# it. If anyone ever wants to move PeerTube to a new hostname,
+# they have to use the upstream `update-host` script after
+# re-running migrations and accept that all federation history is
+# lost.
+HOSTNAME_CACHE="$PERSIST/hostname"
+if [[ -s "$HOSTNAME_CACHE" ]]; then
+    PT_HOSTNAME="$(cat "$HOSTNAME_CACHE")"
+    log "Using cached hostname: $PT_HOSTNAME"
+elif [[ -n "${OPENHOST_ZONE_DOMAIN:-}" ]]; then
+    APP_SUBDOMAIN="${OPENHOST_APP_NAME:-peertube}"
+    PT_HOSTNAME="${APP_SUBDOMAIN}.${OPENHOST_ZONE_DOMAIN}"
+    # Atomic write so a partial write can't leave the cache in a
+    # state that the next boot would mistake for valid.
+    TMP_HOSTNAME="${HOSTNAME_CACHE}.tmp.$$"
+    printf '%s' "$PT_HOSTNAME" > "$TMP_HOSTNAME"
+    mv "$TMP_HOSTNAME" "$HOSTNAME_CACHE"
+    log "First boot — recorded hostname: $PT_HOSTNAME (PERMANENT)"
+else
+    log "FATAL: \$OPENHOST_ZONE_DOMAIN unset and no cached hostname"
+    exit 1
+fi
+if [[ -z "$PT_HOSTNAME" ]]; then
+    log "FATAL: hostname cache resolved to empty string"
+    exit 1
+fi
+
+# Determine HTTPS / port for federation URL construction. In dev
+# (lvh.me / localhost) the OpenHost router serves plain HTTP on a
+# non-standard port; in production it's HTTPS on 443.
+case "${OPENHOST_ZONE_DOMAIN:-}" in
+    lvh.me|*.lvh.me|localhost|*.localhost)
+        PT_HTTPS="false"
+        PT_PORT="80"
+        if [[ -n "${OPENHOST_ROUTER_URL:-}" ]]; then
+            # Strip the scheme and any path component, leaving
+            # `host:port` (or just `host` when port is implicit).
+            # Then peel off the trailing port. ${var##*:} returns
+            # the unmodified string when there's no `:`, so guard
+            # with both a substring test and a numeric regex
+            # before trusting the extracted value.
+            HOSTPORT="${OPENHOST_ROUTER_URL#*://}"
+            HOSTPORT="${HOSTPORT%%/*}"
+            ROUTER_PORT="${HOSTPORT##*:}"
+            if [[ "$HOSTPORT" == *:* && "$ROUTER_PORT" =~ ^[0-9]+$ ]]; then
+                PT_PORT="$ROUTER_PORT"
+            fi
+        fi
+        ;;
+    *)
+        PT_HTTPS="true"
+        PT_PORT="443"
+        ;;
+esac
+
+# -----------------------------------------------------------------
+# Generate / load shared secrets
+# -----------------------------------------------------------------
+# All three secrets are persisted on first boot and re-loaded
+# verbatim on every subsequent boot. Rotating them in place is
+# unsafe: the DB password is encoded into PeerTube's session
+# tokens, and the peertube secret signs HTTP signature keys for
+# federation.
+
+# Persist a secret on first boot, return its value on every boot.
+# Generates a 32-character hex secret by default. Pass `admin` for
+# a URL-safe base64-style password (used for the root admin).
+# Atomic-write so a `set -e`-aborted openssl call can never leave
+# a half-written secret behind for a later boot to misread.
+gen_secret() {
+    local file="$1" kind="${2:-hex32}"
+    if [[ ! -f "$file" ]]; then
+        local tmp="${file}.tmp.$$"
+        case "$kind" in
+            hex24)
+                openssl rand -hex 24 > "$tmp"
+                ;;
+            hex32)
+                openssl rand -hex 32 > "$tmp"
+                ;;
+            admin)
+                # 18 raw bytes -> 24 base64 chars; strip the
+                # non-URL-safe characters (=, +, /). Net length
+                # ~22 chars after stripping: still well above
+                # PeerTube's 6-char minimum.
+                openssl rand -base64 18 | tr -d '=+/\n' > "$tmp"
+                ;;
+            *)
+                log "FATAL: unknown gen_secret kind: $kind"
+                rm -f "$tmp"
+                exit 1
+                ;;
+        esac
+        if [[ ! -s "$tmp" ]]; then
+            rm -f "$tmp"
+            log "FATAL: secret generator produced empty output for $file"
+            exit 1
+        fi
+        chmod 600 "$tmp"
+        mv "$tmp" "$file"
+    fi
+    # Surface corruption rather than hand a zero-length secret to
+    # postgres / redis / PeerTube.
+    if [[ ! -s "$file" ]]; then
+        log "FATAL: secret $file exists but is empty; refusing to use it"
+        exit 1
+    fi
+    cat "$file"
+}
+
+DB_PASSWORD="$(gen_secret "$SECRETS_DIR/db_password" hex24)"
+REDIS_PASSWORD="$(gen_secret "$SECRETS_DIR/redis_password" hex24)"
+PEERTUBE_SECRET_VAL="$(gen_secret "$SECRETS_DIR/peertube_secret" hex32)"
+
+# Admin password: PeerTube reads PT_INITIAL_ROOT_PASSWORD on the
+# very first DB seed (see server/core/initializers/installer.ts
+# in the upstream tree — that file checks for the env var before
+# falling back to a randomly generated one). On subsequent boots
+# the env var is ignored because PeerTube only seeds the root
+# user once.
+ADMIN_PW_FILE="$PERSIST/admin-password.txt"
+PT_ADMIN_PW="$(gen_secret "$ADMIN_PW_FILE" admin)"
+# gen_secret only logs on failure; emit a friendly message on
+# the very first boot so the operator knows where to look.
+if [[ ! -e "$SECRETS_DIR/.admin-pw-announced" ]]; then
+    log "Initial root admin password is in $ADMIN_PW_FILE"
+    : > "$SECRETS_DIR/.admin-pw-announced"
+fi
+
+# -----------------------------------------------------------------
+# Initialize Postgres on first boot
+# -----------------------------------------------------------------
+# We run Postgres on a unix socket in /run/postgresql (only
+# accessible inside the container) plus localhost TCP for
+# PeerTube — PeerTube uses pg through node-postgres which expects
+# a TCP host:port pair (no unix socket support in the production
+# config schema).
+mkdir -p "$PG_DATA"
+chown -R postgres:postgres "$PG_DATA"
+mkdir -p /run/postgresql
+chown postgres:postgres /run/postgresql
+
+if [[ ! -f "$PG_DATA/PG_VERSION" ]]; then
+    log "Initializing PostgreSQL cluster at $PG_DATA"
+    # initdb requires the target dir to be empty *and* owned by
+    # the postgres user (not just writable). The chown above
+    # handles the latter.
+    su postgres -c "/usr/lib/postgresql/15/bin/initdb -D '$PG_DATA' \
+        --auth-local=peer --auth-host=md5 \
+        --encoding=UTF8 --locale=C.UTF-8"
+
+    # Tighten pg_hba: only md5 over loopback TCP (PeerTube), and
+    # peer over the unix socket (us, when we createuser/createdb).
+    cat > "$PG_DATA/pg_hba.conf" <<'EOF'
+# TYPE  DATABASE  USER  ADDRESS         METHOD
+local   all       all                   peer
+host    all       all   127.0.0.1/32    md5
+host    all       all   ::1/128         md5
+EOF
+
+    # Tune for an in-container Postgres: small but reasonable
+    # buffers, keep TCP listener on localhost only, log to
+    # stderr so the OpenHost log pipeline picks it up.
+    cat >> "$PG_DATA/postgresql.conf" <<'EOF'
+
+# OpenHost overrides
+listen_addresses = '127.0.0.1'
+unix_socket_directories = '/run/postgresql'
+shared_buffers = 256MB
+work_mem = 8MB
+maintenance_work_mem = 64MB
+max_connections = 50
+log_destination = 'stderr'
+logging_collector = off
+EOF
+fi
+
+# Clean up stale postmaster.pid from unclean shutdown
+rm -f "$PG_DATA/postmaster.pid"
+
+log "Starting PostgreSQL"
+PG_LOG="$PG_DATA/postgresql.log"
+su postgres -c "/usr/lib/postgresql/15/bin/pg_ctl -D '$PG_DATA' -l '$PG_LOG' -w start \
+    -o '-k /run/postgresql'"
+
+# Create peertube DB + user on first boot (idempotent).
+DB_USER="peertube"
+DB_NAME="peertube_prod"
+
+# Run psql admin commands as the postgres OS user via the unix
+# socket. We use `runuser` (util-linux, present in bookworm) to
+# drop privileges without spawning a login shell.
+#
+# For DDL that contains the generated DB_PASSWORD, we write the
+# statements to a mode-0600 file owned by postgres and pass that
+# file with `psql -f`. This keeps the password out of:
+#   * argv  — psql -c is not used for password-bearing DDL,
+#             so /proc/<pid>/cmdline never contains the secret.
+#   * env   — env vars work but psql's :'name' interpolation
+#             only expands psql-side variables (set with -v
+#             name=value), not OS env vars. Using -v would put
+#             the password back into argv. The temp-file route
+#             is the only approach that meets both constraints.
+PSQL_BASE=(psql -h /run/postgresql --no-psqlrc -X -v ON_ERROR_STOP=1)
+
+psql_postgres() {
+    # Run psql with the supplied args (no password leakage by caller).
+    runuser -u postgres -- "${PSQL_BASE[@]}" "$@"
+}
+
+run_password_sql() {
+    # Args: SQL with literal placeholders __DBUSER__ and __DBPW__.
+    # We materialise the SQL into a per-boot tmp file with 0600
+    # perms, owned by postgres, run psql -f, then unlink. The
+    # subshell-scoped EXIT trap guarantees the file is removed
+    # even if psql fails — `set -euo pipefail` would otherwise
+    # exit the start.sh leaving the rendered SQL (with embedded
+    # password) on disk for forensic recovery.
+    local sql_template="$1"
+    (
+        local sql_file
+        # mktemp creates the file with mode 0600 by default; we
+        # chown it to postgres so psql can read it after runuser
+        # drops privileges. The file lives just long enough to
+        # be read by psql once.
+        sql_file="$(mktemp -p "$TEMP" peertube-ddl.XXXXXX.sql)"
+        trap 'rm -f "$sql_file"' EXIT
+        chmod 600 "$sql_file"
+        chown postgres:postgres "$sql_file"
+        local rendered
+        rendered="${sql_template//__DBUSER__/$DB_USER}"
+        rendered="${rendered//__DBPW__/$DB_PASSWORD}"
+        printf '%s\n' "$rendered" > "$sql_file"
+        psql_postgres -f "$sql_file"
+    )
+}
+
+if ! psql_postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='$DB_USER'" | grep -q 1; then
+    log "Creating peertube database role"
+    # CAUTION: __DBPW__ is interpolated as a SQL string literal.
+    # The hex-only output of `openssl rand -hex` cannot contain a
+    # single quote, so we don't need additional escaping. If the
+    # generator is ever changed to emit other characters, this
+    # path must also start escaping single quotes.
+    run_password_sql "CREATE USER \"__DBUSER__\" WITH PASSWORD '__DBPW__';"
+fi
+# Always re-set the password to the current secret to recover
+# from operator-side rotation of secrets/db_password. Idempotent.
+run_password_sql "ALTER USER \"__DBUSER__\" WITH PASSWORD '__DBPW__';"
+
+if ! psql_postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$DB_NAME'" | grep -q 1; then
+    log "Creating $DB_NAME database"
+    psql_postgres -c "CREATE DATABASE $DB_NAME OWNER $DB_USER"
+fi
+
+# PeerTube needs unaccent + pg_trgm extensions. They must be
+# created by a superuser (postgres), not the peertube role.
+psql_postgres -d "$DB_NAME" -c 'CREATE EXTENSION IF NOT EXISTS unaccent'
+psql_postgres -d "$DB_NAME" -c 'CREATE EXTENSION IF NOT EXISTS pg_trgm'
+
+# -----------------------------------------------------------------
+# Start Redis
+# -----------------------------------------------------------------
+# Generate a minimal redis.conf each boot. Redis runs as the
+# `redis` user (created by the apt package) with appendonly
+# persistence under $PERSIST/redis.
+chown -R redis:redis "$REDIS_DIR"
+
+REDIS_CONF="$REDIS_DIR/redis.conf"
+# Redis stores requirepass in plaintext, so the conf file must
+# not be world-readable. Create with a restrictive umask in a
+# subshell, then explicitly chmod 600 in case the umask doesn't
+# stick on this filesystem.
+(
+    umask 077
+    cat > "$REDIS_CONF" <<EOF
+bind 127.0.0.1 -::1
+port 6379
+unixsocket /run/redis/redis.sock
+unixsocketperm 770
+dir $REDIS_DIR
+appendonly yes
+appendfilename "appendonly.aof"
+dbfilename dump.rdb
+requirepass $REDIS_PASSWORD
+# Redis spawns AOF rewrite children. Keep their working dir under
+# $REDIS_DIR so they don't leak into /tmp.
+maxmemory 256mb
+maxmemory-policy allkeys-lru
+# Run in foreground; supervisor relies on stdout for process
+# liveness and signal forwarding.
+daemonize no
+loglevel notice
+EOF
+)
+chmod 600 "$REDIS_CONF"
+chown redis:redis "$REDIS_CONF"
+mkdir -p /run/redis && chown redis:redis /run/redis
+
+# Centralised "stop the postgres daemon if it's running" helper
+# used by both the early-exit teardown (Redis or PeerTube failed
+# to start) and the supervisor `teardown` (a child died after
+# everything was up). pg_ctl stop -m fast flushes WAL and exits
+# cleanly even if the postmaster never came up; the `|| true`
+# absorbs that benign failure.
+stop_postgres() {
+    su postgres -c \
+        "/usr/lib/postgresql/15/bin/pg_ctl -D '$PG_DATA' -m fast -w stop" \
+        2>/dev/null || true
+}
+
+# Helper used by the two early-exit code paths below (Redis
+# never came up, PeerTube never started). Mirrors the eventual
+# `teardown` function used by the supervisor proper. Defined
+# here because it's referenced by the readiness-check failure
+# branches; the supervisor `teardown` is defined later because
+# it depends on $PEERTUBE_PID and $PG_WATCHER_PID which don't
+# exist yet at this point.
+early_exit_teardown() {
+    if [[ -n "${REDIS_PID:-}" ]]; then
+        kill -TERM "$REDIS_PID" 2>/dev/null || true
+    fi
+    # Postgres outlives this start.sh as an orphan daemon
+    # otherwise (the container runtime would eventually reap
+    # it, but stopping it here flushes WAL).
+    stop_postgres
+}
+
+log "Starting Redis"
+# Drop privileges to the `redis` user via runuser so the path is
+# parsed once by *our* shell (not re-parsed by su's spawned
+# shell, which would word-split a $REDIS_CONF that contains
+# spaces). With `runuser -u redis -- redis-server "$REDIS_CONF"`
+# we hand redis-server its argv directly.
+runuser -u redis -- redis-server "$REDIS_CONF" &
+REDIS_PID=$!
+
+redis_ping() {
+    # Pass the Redis password via REDISCLI_AUTH so it doesn't
+    # land in argv (and therefore /proc/<pid>/cmdline and `ps`
+    # output) every readiness-check iteration. redis-cli reads
+    # this env var natively when -a is absent.
+    REDISCLI_AUTH="$REDIS_PASSWORD" \
+        redis-cli --no-auth-warning -h 127.0.0.1 -p 6379 \
+        ping 2>/dev/null | grep -q PONG
+}
+
+# Wait for Redis to come up before starting PeerTube — PeerTube
+# crash-exits if its initial Redis connect fails.
+REDIS_READY=0
+for _ in $(seq 1 30); do
+    if redis_ping; then
+        REDIS_READY=1
+        break
+    fi
+    sleep 0.5
+done
+if [[ "$REDIS_READY" -ne 1 ]]; then
+    log "FATAL: Redis didn't come up in 15s"
+    early_exit_teardown
+    exit 1
+fi
+
+# -----------------------------------------------------------------
+# Configure PeerTube via env vars
+# -----------------------------------------------------------------
+# The upstream image's NODE_CONFIG_DIR is
+#   /app/config:/app/support/docker/production/config:/config
+# so /app/support/docker/production/config/production.yaml is the
+# base config (which sets `database.hostname: postgres` etc.) and
+# the env-mapping in custom-environment-variables.yaml in the same
+# dir overrides specific keys from PEERTUBE_* env vars at startup.
+# We rely entirely on env vars; no need to write production.yaml.
+
+export PEERTUBE_DB_HOSTNAME=127.0.0.1
+export PEERTUBE_DB_PORT=5432
+export PEERTUBE_DB_USERNAME="$DB_USER"
+export PEERTUBE_DB_PASSWORD="$DB_PASSWORD"
+export PEERTUBE_DB_NAME="$DB_NAME"
+export PEERTUBE_DB_SSL=false
+
+export PEERTUBE_REDIS_HOSTNAME=127.0.0.1
+export PEERTUBE_REDIS_PORT=6379
+export PEERTUBE_REDIS_AUTH="$REDIS_PASSWORD"
+
+export PEERTUBE_WEBSERVER_HOSTNAME="$PT_HOSTNAME"
+export PEERTUBE_WEBSERVER_PORT="$PT_PORT"
+export PEERTUBE_WEBSERVER_HTTPS="$PT_HTTPS"
+
+# trust_proxy is JSON-format per the upstream config schema. We
+# trust loopback because that is exactly where the OpenHost router
+# proxies in from inside the rootless network namespace.
+export PEERTUBE_TRUST_PROXY='["127.0.0.1","loopback"]'
+
+export PEERTUBE_SECRET="$PEERTUBE_SECRET_VAL"
+
+# Make storage paths land inside our persistent peertube-data dir.
+# The upstream production.yaml uses relative paths like
+# `../data/avatars/` interpreted from /app, which would map them
+# to /data inside the container — but on OpenHost /data is the
+# OpenHost data root, not specifically PeerTube's. We point each
+# storage root explicitly at $PEERTUBE_DATA_DIR/<subdir>.
+mkdir -p \
+    "$PEERTUBE_DATA_DIR/tmp-persistent" \
+    "$PEERTUBE_DATA_DIR/bin" \
+    "$PEERTUBE_DATA_DIR/avatars" \
+    "$PEERTUBE_DATA_DIR/web-videos" \
+    "$PEERTUBE_DATA_DIR/streaming-playlists" \
+    "$PEERTUBE_DATA_DIR/original-video-files" \
+    "$PEERTUBE_DATA_DIR/redundancy" \
+    "$PEERTUBE_DATA_DIR/logs" \
+    "$PEERTUBE_DATA_DIR/previews" \
+    "$PEERTUBE_DATA_DIR/thumbnails" \
+    "$PEERTUBE_DATA_DIR/storyboards" \
+    "$PEERTUBE_DATA_DIR/torrents" \
+    "$PEERTUBE_DATA_DIR/captions" \
+    "$PEERTUBE_DATA_DIR/cache" \
+    "$PEERTUBE_DATA_DIR/plugins" \
+    "$PEERTUBE_DATA_DIR/well-known" \
+    "$PEERTUBE_DATA_DIR/uploads" \
+    "$PEERTUBE_DATA_DIR/client-overrides"
+
+# /tmp is on app_temp_data — it's huge and ephemeral, perfect for
+# in-flight uploads and ffmpeg scratch space.
+PEERTUBE_TMP_DIR="$TEMP/peertube-tmp"
+mkdir -p "$PEERTUBE_TMP_DIR"
+
+export PEERTUBE_STORAGE_TMP="$PEERTUBE_TMP_DIR"
+export PEERTUBE_STORAGE_TMP_PERSISTENT="$PEERTUBE_DATA_DIR/tmp-persistent"
+export PEERTUBE_STORAGE_BIN="$PEERTUBE_DATA_DIR/bin"
+export PEERTUBE_STORAGE_AVATARS="$PEERTUBE_DATA_DIR/avatars"
+export PEERTUBE_STORAGE_WEB_VIDEOS="$PEERTUBE_DATA_DIR/web-videos"
+export PEERTUBE_STORAGE_STREAMING_PLAYLISTS="$PEERTUBE_DATA_DIR/streaming-playlists"
+export PEERTUBE_STORAGE_ORIGINAL_VIDEO_FILES="$PEERTUBE_DATA_DIR/original-video-files"
+export PEERTUBE_STORAGE_REDUNDANCY="$PEERTUBE_DATA_DIR/redundancy"
+export PEERTUBE_STORAGE_LOGS="$PEERTUBE_DATA_DIR/logs"
+export PEERTUBE_STORAGE_PREVIEWS="$PEERTUBE_DATA_DIR/previews"
+export PEERTUBE_STORAGE_THUMBNAILS="$PEERTUBE_DATA_DIR/thumbnails"
+export PEERTUBE_STORAGE_STORYBOARDS="$PEERTUBE_DATA_DIR/storyboards"
+export PEERTUBE_STORAGE_TORRENTS="$PEERTUBE_DATA_DIR/torrents"
+export PEERTUBE_STORAGE_CAPTIONS="$PEERTUBE_DATA_DIR/captions"
+export PEERTUBE_STORAGE_CACHE="$PEERTUBE_DATA_DIR/cache"
+export PEERTUBE_STORAGE_PLUGINS="$PEERTUBE_DATA_DIR/plugins"
+export PEERTUBE_STORAGE_WELL_KNOWN="$PEERTUBE_DATA_DIR/well-known"
+export PEERTUBE_STORAGE_UPLOADS="$PEERTUBE_DATA_DIR/uploads"
+export PEERTUBE_STORAGE_CLIENT_OVERRIDES="$PEERTUBE_DATA_DIR/client-overrides"
+
+# First-boot admin password. PeerTube only reads this env var
+# when its installer hasn't seeded the application table yet, so
+# leaving it set on subsequent boots is safe — it's a no-op.
+export PT_INITIAL_ROOT_PASSWORD="$PT_ADMIN_PW"
+
+# Provide an admin email so password-reset emails would have a
+# from-address set if SMTP is later configured. Setting it now
+# means the operator can later add SMTP and existing accounts
+# already have an admin contact recorded. We use a noreply at the
+# canonical hostname — purely a placeholder.
+: "${PEERTUBE_ADMIN_EMAIL:=admin@${PT_HOSTNAME}}"
+export PEERTUBE_ADMIN_EMAIL
+
+# -----------------------------------------------------------------
+# Ensure peertube user can write to data dirs
+# -----------------------------------------------------------------
+# The upstream image runs PeerTube as the `peertube` system user
+# (uid 999). $PEERTUBE_DATA_DIR was created by us as root above;
+# fix ownership so node can write to it. We do this every boot to
+# self-heal any external `chown` mishaps.
+chown -R peertube:peertube \
+    "$PEERTUBE_DATA_DIR" \
+    "$PEERTUBE_TMP_DIR"
+
+# -----------------------------------------------------------------
+# Start PeerTube
+# -----------------------------------------------------------------
+# Drop privileges to peertube via gosu (already in the base image).
+# We pass --max-old-space-size to give node enough heap for video
+# upload buffering; PeerTube's own docs recommend 1500 MiB on a
+# 2 GiB host.
+log "Starting PeerTube on $PT_HOSTNAME"
+cd /app
+gosu peertube node --max-old-space-size=1500 dist/server &
+PEERTUBE_PID=$!
+
+# Make sure node actually exec'd. If `gosu` or `node` failed
+# during startup (e.g. dist/server missing, peertube user not
+# present), $PEERTUBE_PID points at a process that is already
+# dead; without this check, `wait -n` later would just see it
+# exit immediately with no diagnostic about which child died.
+sleep 1
+if ! kill -0 "$PEERTUBE_PID" 2>/dev/null; then
+    log "FATAL: PeerTube node process exited before supervisor started"
+    early_exit_teardown
+    exit 1
+fi
+
+# -----------------------------------------------------------------
+# Supervisor
+# -----------------------------------------------------------------
+# Forward SIGTERM/SIGINT to all three children + the postgres
+# postmaster. We don't track postmaster's PID directly (pg_ctl
+# starts it as a daemonized child of postgres) so we send the
+# signal via pg_ctl stop on shutdown. Redis and PeerTube have
+# their PIDs.
+#
+# Renamed from the more obvious `shutdown` to avoid shadowing
+# /usr/sbin/shutdown — a future maintainer who wants to
+# system-halt the container would otherwise silently call this
+# function instead.
+PG_WATCHER_PID=""
+TEARDOWN_DONE=0
+teardown() {
+    # Bash invokes the trap and the explicit post-`wait` cleanup
+    # consecutively when the supervisor receives SIGTERM during
+    # `wait -n`. Guard against the second invocation so we don't
+    # log "Shutting down children" twice or send superfluous
+    # signals into pid-recycled territory.
+    if [[ "$TEARDOWN_DONE" -eq 1 ]]; then
+        return
+    fi
+    TEARDOWN_DONE=1
+    log "Shutting down children"
+    if [[ -n "$PG_WATCHER_PID" ]]; then
+        kill -TERM "$PG_WATCHER_PID" 2>/dev/null || true
+    fi
+    kill -TERM "$PEERTUBE_PID" "$REDIS_PID" 2>/dev/null || true
+    stop_postgres
+    wait || true
+}
+trap teardown TERM INT
+
+# `wait -n` blocks until any of the bash-tracked children exits.
+# Postgres is daemonized so it isn't in our wait set; we have to
+# poll its postmaster.pid separately. We use a tiny background
+# poller that signals SIGTERM to ourselves if Postgres ever exits
+# unexpectedly so the supervisor unwinds.
+(
+    while true; do
+        sleep 5
+        if [[ ! -f "$PG_DATA/postmaster.pid" ]]; then
+            log "Postgres died unexpectedly; tearing down"
+            kill -TERM $$
+            exit 0
+        fi
+    done
+) &
+PG_WATCHER_PID=$!
+
+set +e
+wait -n "$PEERTUBE_PID" "$REDIS_PID"
+EXIT_CODE=$?
+set -e
+
+log "Child exited (code=$EXIT_CODE); shutting down container"
+teardown
+exit "$EXIT_CODE"
