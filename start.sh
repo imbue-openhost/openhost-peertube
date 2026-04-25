@@ -554,6 +554,9 @@ chown -R peertube:peertube \
 # upload buffering; PeerTube's own docs recommend 1500 MiB on a
 # 2 GiB host.
 log "Starting PeerTube on $PT_HOSTNAME (loopback :9001)"
+log "DEBUG: PEERTUBE_LISTEN_PORT=$PEERTUBE_LISTEN_PORT"
+log "DEBUG: PEERTUBE_WEBSERVER_HOSTNAME=$PEERTUBE_WEBSERVER_HOSTNAME"
+log "DEBUG: PEERTUBE_WEBSERVER_PORT=$PEERTUBE_WEBSERVER_PORT"
 cd /app
 gosu peertube node --max-old-space-size=1500 dist/server &
 PEERTUBE_PID=$!
