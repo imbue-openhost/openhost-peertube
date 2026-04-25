@@ -56,6 +56,7 @@ RUN apt-get update \
         tini \
         procps \
         util-linux \
+        caddy \
  && rm -rf /var/lib/apt/lists/*
 
 # Postgres' Debian package ships a "main" cluster auto-created at
@@ -74,11 +75,13 @@ RUN if [ -d /var/lib/postgresql/15/main ]; then \
 # redis.conf at boot pointing at $OPENHOST_APP_DATA_DIR/redis.
 RUN rm -rf /var/lib/redis/* /etc/redis/redis.conf || true
 
-# Copy our startup wrapper. It generates DB + Redis + admin
-# passwords on first boot, persists them under
-# $OPENHOST_APP_DATA_DIR, then starts postgres, redis, and the
-# PeerTube node process under a bash supervisor.
+# Copy our startup wrapper + Caddyfile. start.sh generates
+# DB + Redis + admin passwords on first boot, persists them
+# under $OPENHOST_APP_DATA_DIR, and starts postgres, redis,
+# Caddy (host-rewriter front-door), and the PeerTube node
+# process under a bash supervisor.
 COPY start.sh /opt/openhost-peertube/start.sh
+COPY Caddyfile /opt/openhost-peertube/Caddyfile
 RUN chmod +x /opt/openhost-peertube/start.sh
 
 # OpenHost will route http://peertube.<zone>/... to this port.

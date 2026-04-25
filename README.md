@@ -8,13 +8,26 @@ as a single-container OpenHost app.
 * PostgreSQL 15
 * Redis 7 (whatever bookworm-main ships)
 * PeerTube (`chocobozzz/peertube:production-bookworm`, currently v7.x)
+* Caddy 2 (one-job front-door — see below)
 * ffmpeg, invoked on-demand by the PeerTube node process for transcoding
   (it is not a long-lived service)
 
-The three long-lived services — Postgres, Redis, and PeerTube — are
-supervised by a small bash parent (`start.sh`) that starts them in
+The four long-lived services — Postgres, Redis, PeerTube, and Caddy —
+are supervised by a small bash parent (`start.sh`) that starts them in
 that order and tears the whole container down if any one exits.
 OpenHost notices the exit and restarts us.
+
+### Why Caddy?
+
+PeerTube hard-checks `req.headers.host == webserver.hostname[:port]`
+on its `/api/v1/oauth-clients/local` endpoint and returns 403
+otherwise. The OpenHost router proxies via httpx and strips the
+original Host header (httpx sets it to the upstream URL — i.e.
+`127.0.0.1:9000`) so PeerTube would always 403. The router does set
+`X-Forwarded-Host` correctly, so we run a tiny Caddy on the
+container's exposed port (9000) whose only job is to rewrite the Host
+header from `X-Forwarded-Host` before forwarding to PeerTube on
+loopback :9001. See `Caddyfile` for the config.
 
 ## ⚠️ Federation hostname is permanent
 

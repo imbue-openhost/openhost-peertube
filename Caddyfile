@@ -1,0 +1,71 @@
+# Tiny Caddy front-door whose only job is to rewrite the Host
+# header before forwarding to PeerTube on the loopback port.
+#
+# Background: PeerTube's /api/v1/oauth-clients/local handler
+# explicitly checks `req.headers.host == webserver.hostname[:port]`
+# and returns 403 otherwise. This is a hard-coded sanity check
+# that ensures clients fetching OAuth tokens are talking to the
+# canonical hostname (and not, say, a misconfigured reverse
+# proxy that accidentally exposes the local-loopback API to a
+# different vhost).
+#
+# The OpenHost router proxies via httpx and excludes the
+# original Host header, so by the time the request reaches
+# PeerTube the Host is `127.0.0.1:9000` — which never matches
+# the canonical hostname and trips the 403. The router does set
+# X-Forwarded-Host correctly, so we just have to rewrite Host
+# from that header before the request hits PeerTube.
+#
+# Caddy listens on :9000 (the port openhost.toml advertises);
+# PeerTube actually runs on :9001 inside the container.
+
+{
+	# No admin API, no automatic HTTPS — we are loopback-only.
+	# auto_https off keeps Caddy from trying to provision certs
+	# for the bare hostname (which would fail and noisily retry).
+	admin off
+	auto_https off
+	# Caddy's default error log goes to stderr, which is what
+	# the OpenHost log pipeline reads. Keep it minimal so we
+	# don't drown out PeerTube's own logs.
+	log {
+		level WARN
+		output stderr
+	}
+}
+
+# Listen on the port advertised in openhost.toml. The router
+# proxies to 127.0.0.1:<host_port> which Podman maps to
+# container_port 9000 -> this Caddy.
+:9000 {
+	# Rewrite the Host header from X-Forwarded-Host before
+	# proxying to PeerTube on its loopback port. If the header
+	# is absent (which would only happen if something other
+	# than the OpenHost router talked to us — there shouldn't
+	# be such a path on a real deploy), fall through to
+	# whatever Host the client sent.
+	#
+	# Caddy's `request_header Host {header.X-Forwarded-Host}`
+	# rewrites the header on the request that gets forwarded
+	# to the backend, NOT the response.
+	@has_xfh header X-Forwarded-Host *
+	handle @has_xfh {
+		request_header Host {header.X-Forwarded-Host}
+		reverse_proxy 127.0.0.1:9001 {
+			# Preserve the X-Forwarded-* headers the OpenHost
+			# router stamped on the request. Caddy's default
+			# is to set/append them, which would clobber the
+			# router's value with Caddy's view of the client
+			# IP (127.0.0.1, the router itself).
+			header_up X-Forwarded-For    {header.X-Forwarded-For}
+			header_up X-Forwarded-Proto  {header.X-Forwarded-Proto}
+			header_up X-Forwarded-Host   {header.X-Forwarded-Host}
+			# WebSocket upgrade handling is automatic in
+			# reverse_proxy; PeerTube uses ws for live
+			# transcoding job updates and the embed player.
+		}
+	}
+	handle {
+		reverse_proxy 127.0.0.1:9001
+	}
+}

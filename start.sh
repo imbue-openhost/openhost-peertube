@@ -344,7 +344,13 @@ requirepass $REDIS_PASSWORD
 # Redis spawns AOF rewrite children. Keep their working dir under
 # $REDIS_DIR so they don't leak into /tmp.
 maxmemory 256mb
-maxmemory-policy allkeys-lru
+# noeviction is REQUIRED by PeerTube's bull queue (and by Redis
+# generally for any system using it as a job/state store, not
+# a cache). With allkeys-lru, Redis will silently drop pending
+# upload chunks, federation outbox jobs, and live-stream state
+# to stay under maxmemory — corrupting PeerTube's behaviour
+# in subtle ways.
+maxmemory-policy noeviction
 # Run in foreground; supervisor relies on stdout for process
 # liveness and signal forwarding.
 daemonize no
@@ -441,6 +447,16 @@ export PEERTUBE_REDIS_HOSTNAME=127.0.0.1
 export PEERTUBE_REDIS_PORT=6379
 export PEERTUBE_REDIS_AUTH="$REDIS_PASSWORD"
 
+# PeerTube runs on 9001; the Caddy sidecar listens on 9000
+# (the port openhost.toml advertises) and rewrites the Host
+# header before forwarding to PeerTube. PeerTube's
+# /api/v1/oauth-clients/local handler hard-rejects requests
+# whose Host doesn't match webserver.hostname[:port], and the
+# OpenHost router strips Host before proxying — so we have to
+# reconstitute it from X-Forwarded-Host. See ./Caddyfile.
+export PEERTUBE_LISTEN_HOSTNAME=127.0.0.1
+export PEERTUBE_LISTEN_PORT=9001
+
 export PEERTUBE_WEBSERVER_HOSTNAME="$PT_HOSTNAME"
 export PEERTUBE_WEBSERVER_PORT="$PT_PORT"
 export PEERTUBE_WEBSERVER_HTTPS="$PT_HTTPS"
@@ -534,7 +550,7 @@ chown -R peertube:peertube \
 # We pass --max-old-space-size to give node enough heap for video
 # upload buffering; PeerTube's own docs recommend 1500 MiB on a
 # 2 GiB host.
-log "Starting PeerTube on $PT_HOSTNAME"
+log "Starting PeerTube on $PT_HOSTNAME (loopback :9001)"
 cd /app
 gosu peertube node --max-old-space-size=1500 dist/server &
 PEERTUBE_PID=$!
@@ -547,6 +563,38 @@ PEERTUBE_PID=$!
 sleep 1
 if ! kill -0 "$PEERTUBE_PID" 2>/dev/null; then
     log "FATAL: PeerTube node process exited before supervisor started"
+    early_exit_teardown
+    exit 1
+fi
+
+# -----------------------------------------------------------------
+# Start Caddy (host-rewriter front-door)
+# -----------------------------------------------------------------
+# Caddy binds :9000 — the port advertised in openhost.toml — and
+# proxies every request to PeerTube on 127.0.0.1:9001 with the
+# Host header reconstituted from X-Forwarded-Host. This satisfies
+# PeerTube's hard-coded canonical-Host check on
+# /api/v1/oauth-clients/local without needing to dig that
+# behaviour out of upstream.
+#
+# Caddy is a static binary; start it under nobody to avoid having
+# yet another running-as-root daemon. The bookworm package ships
+# a `caddy` system user we could use, but `nobody` is universal
+# and Caddy doesn't need persistent state for this config.
+log "Starting Caddy host-rewriter on :9000 -> :9001"
+runuser -u nobody -- caddy run \
+    --config /opt/openhost-peertube/Caddyfile \
+    --adapter caddyfile &
+CADDY_PID=$!
+
+# Caddy startup is fast (~100ms) but give it a moment to bind
+# the port before the OpenHost router's first health check.
+# Bail loudly if it never came up — without Caddy the whole
+# stack is unreachable.
+sleep 1
+if ! kill -0 "$CADDY_PID" 2>/dev/null; then
+    log "FATAL: Caddy exited before supervisor started"
+    kill -TERM "$PEERTUBE_PID" 2>/dev/null || true
     early_exit_teardown
     exit 1
 fi
@@ -580,7 +628,7 @@ teardown() {
     if [[ -n "$PG_WATCHER_PID" ]]; then
         kill -TERM "$PG_WATCHER_PID" 2>/dev/null || true
     fi
-    kill -TERM "$PEERTUBE_PID" "$REDIS_PID" 2>/dev/null || true
+    kill -TERM "$PEERTUBE_PID" "$REDIS_PID" "$CADDY_PID" 2>/dev/null || true
     stop_postgres
     wait || true
 }
@@ -604,7 +652,7 @@ trap teardown TERM INT
 PG_WATCHER_PID=$!
 
 set +e
-wait -n "$PEERTUBE_PID" "$REDIS_PID"
+wait -n "$PEERTUBE_PID" "$REDIS_PID" "$CADDY_PID"
 EXIT_CODE=$?
 set -e
 
