@@ -27,10 +27,12 @@
 //
 //   1. /plugins/auth-openhost-sso/router/auto-login
 //        Hit by the auth-proxy sidecar via 302 on every owner-HTML
-//        navigation that doesn't already have a PeerTube session
-//        (i.e. the OAuth refresh-token path didn't work and the
-//        SPA is rendering anonymous).  Verifies the zone_auth
-//        cookie and short-circuits the auth flow.
+//        navigation that the sidecar hasn't already bounced (i.e.
+//        the bounce-marker cookie isn't yet set in the request).
+//        The bounce fires regardless of the SPA's own auth state
+//        — if the SPA already has valid OAuth tokens in
+//        localStorage, redeeming a fresh externalAuthToken just
+//        refreshes them, which is harmless.
 //
 //   2. /plugins/auth-openhost-sso/<version>/auth/openhost-sso
 //        PeerTube's standard external-auth URL — the URL that's
@@ -159,8 +161,16 @@ async function register ({
   // /plugins/<name>/<version>/router/<route>.  The auth-proxy
   // sidecar uses the un-versioned form so it doesn't have to
   // track plugin version bumps.
+  //
+  // Express 4 (used by PeerTube 7.x) does NOT auto-await async
+  // route handlers — a Promise rejection escaping the handler
+  // becomes an UnhandledPromiseRejectionWarning and the client
+  // hangs with no response.  Wrap each entry point in
+  // ``runHandler`` which awaits and routes any unanticipated
+  // rejection through the same login-failure redirect the
+  // handler would have returned itself.
   const router = getRouter()
-  router.get('/auto-login', (req, res) => handleAuthRequest(req, res))
+  router.get('/auto-login', (req, res) => runHandler(req, res))
 
   // Standard external-auth registration: shows up as a "Login with
   // OpenHost" button on /login.  Visitors who somehow end up on
@@ -170,9 +180,14 @@ async function register ({
   const result = registerExternalAuth({
     authName: AUTH_NAME,
     authDisplayName: () => AUTH_DISPLAY_NAME,
-    onAuthRequest: (req, res) => handleAuthRequest(req, res)
+    onAuthRequest: (req, res) => runHandler(req, res)
   })
   store.userAuthenticated = result.userAuthenticated
+  // Capture the unregister hook so unregister() can fully tear
+  // down the external-auth registration on plugin uninstall /
+  // reload, instead of leaving a stale entry pointing at the
+  // now-nulled callback.
+  store.unregisterExternalAuth = unregisterExternalAuth
 
   logger.info(
     'auth-openhost-sso: registered (router=%s, auth=%s, fallback_email=%s)',
@@ -183,21 +198,83 @@ async function register ({
 }
 
 async function unregister () {
-  // ``store.jwks`` holds open sockets to the router and timer
-  // handles for periodic refresh.  Release them so a hot-reload
-  // (uninstall/reinstall via the admin UI) doesn't leak them.
-  if (store.jwks && typeof store.jwks.close === 'function') {
+  // Pull the external-auth registration out of PeerTube's
+  // in-memory map so a hot-reload (uninstall / reinstall via
+  // the admin UI, or a settings change that triggers re-init)
+  // doesn't leave a stale entry pointing at the now-nulled
+  // ``store.userAuthenticated`` callback.
+  if (typeof store.unregisterExternalAuth === 'function') {
     try {
-      store.jwks.close()
+      store.unregisterExternalAuth(AUTH_NAME)
     } catch (err) {
-      // jwks-rsa's close is synchronous and can't fail in
-      // documented ways; logging just in case a future version
-      // changes that.
-      if (store.logger) store.logger.debug('auth-openhost-sso: jwks close failed', { err })
+      if (store.logger) {
+        store.logger.warn(
+          'auth-openhost-sso: unregisterExternalAuth threw',
+          { err }
+        )
+      }
     }
   }
+  // The jwks-rsa client we currently use exposes no documented
+  // ``.close()``; on the versions PeerTube ships this means the
+  // background TTL refresh interval keeps the Node event loop
+  // alive until process exit.  Plugin unregister already runs
+  // at shutdown / reload so the cost is bounded; we just drop
+  // our reference.  If a future jwks-rsa adds an explicit
+  // close, ``releaseJwks`` is the central place to call it.
+  releaseJwks(store.jwks)
   store.jwks = null
   store.userAuthenticated = null
+  store.unregisterExternalAuth = null
+}
+
+// Internal helper: synchronous-best-effort cleanup for a
+// jwks-rsa client.  Centralised so both ``unregister()`` and
+// ``loadRouterSetting()`` (which replaces the client on a
+// settings change) handle teardown the same way.
+function releaseJwks (client) {
+  if (!client) return
+  // Some forks / future jwks-rsa releases expose a ``close``
+  // method.  We probe and call defensively.
+  if (typeof client.close === 'function') {
+    try {
+      client.close()
+    } catch (err) {
+      if (store.logger) {
+        store.logger.debug('auth-openhost-sso: jwks close failed', { err })
+      }
+    }
+  }
+}
+
+// Express-4 wrapper: route handlers must not leak async
+// rejections.  Awaits the inner promise and, on any escape,
+// emits a generic external-auth-error redirect (idempotent
+// even if a previous handler call already wrote headers — we
+// guard with res.headersSent).
+async function runHandler (req, res) {
+  try {
+    await handleAuthRequest(req, res)
+  } catch (err) {
+    if (store.logger) {
+      store.logger.error('auth-openhost-sso: handler threw', { err })
+    }
+    if (!res.headersSent) {
+      try {
+        res.redirect('/login?externalAuthError=true')
+      } catch (redirectErr) {
+        // Response already half-sent or socket is closed.
+        // Nothing useful to do; swallow so we don't crash the
+        // Node process with an UnhandledPromiseRejection.
+        if (store.logger) {
+          store.logger.debug(
+            'auth-openhost-sso: error-path redirect failed',
+            { err: redirectErr }
+          )
+        }
+      }
+    }
+  }
 }
 
 module.exports = { register, unregister }
@@ -212,7 +289,9 @@ async function loadRouterSetting (settingsManager) {
   if (!trimmed) {
     // No URL — we can't verify anything.  Drop any old client so
     // a stale URL doesn't continue to be used.  handleAuthRequest
-    // checks for null and returns a clean 503-equivalent.
+    // checks for null and returns a clean external-auth-error
+    // redirect.
+    releaseJwks(store.jwks)
     store.routerUrl = null
     store.jwks = null
     if (store.logger) {
@@ -229,6 +308,7 @@ async function loadRouterSetting (settingsManager) {
     // eslint-disable-next-line no-new
     new URL(trimmed)
   } catch (err) {
+    releaseJwks(store.jwks)
     store.routerUrl = null
     store.jwks = null
     if (store.logger) {
@@ -241,6 +321,11 @@ async function loadRouterSetting (settingsManager) {
   }
   if (store.routerUrl === trimmed && store.jwks) return
 
+  // URL changed — release the previous client's resources before
+  // dropping our reference to it.  releaseJwks no-ops on null
+  // and on clients that don't expose a close method, so this is
+  // safe regardless of the current jwks-rsa shape.
+  releaseJwks(store.jwks)
   store.routerUrl = trimmed
   store.jwks = jwksClient({
     jwksUri: trimmed.replace(/\/$/, '') + '/.well-known/jwks.json',

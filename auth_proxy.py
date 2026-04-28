@@ -33,23 +33,17 @@ Caddy → PeerTube backend.  Two responsibilities:
    the token.  The marker has a short TTL (5 minutes) — long
    enough to cover the redirect chain plus normal navigation,
    short enough that an owner who explicitly logs out of
-   PeerTube gets a fresh SSO trampoline on their next page
-   load instead of being stuck anonymous.
+   PeerTube gets a fresh SSO bounce on their next page load
+   instead of being stuck anonymous.
 
-This file is intentionally simple.  In an earlier revision it
-also minted PeerTube OAuth tokens directly (calling
-``/api/v1/users/token`` with grant_type=password and the cached
-admin password) and primed ``localStorage`` via an inline HTML
-trampoline.  That approach worked end-to-end as far as the API
-went but failed to fully bootstrap the SPA: the SPA's auth
-state machine reads more localStorage keys than the trampoline
-populated (id, username, email, role on top of the
-access/refresh/type triple), and matching the SPA's internal
-contract against a moving upstream is brittle.  Routing through
-the plugin's ``registerExternalAuth`` flow puts ALL the
-identity-bootstrap responsibility back inside PeerTube — which
-both fixes the bug and removes ~700 lines of trampoline-state
-machinery from this file.
+Routing the actual sign-in through PeerTube's plugin API
+(rather than priming ``localStorage`` from this sidecar) keeps
+the SPA's auth bootstrap entirely inside PeerTube.  The SPA
+reads several localStorage keys on boot to reconstruct an
+authenticated user (the OAuth token triple plus four user-
+identity fields); the externalAuthToken round-trip writes all
+of them via PeerTube's native code paths so the sidecar never
+has to track the SPA's internal storage contract.
 
 Federation is wholly unaffected: remote ActivityPub servers
 don't carry ``zone_auth``, don't reach the bounce, and see
@@ -121,7 +115,7 @@ SSO_MARKER_COOKIE = "openhost_pt_sso_marker"
 # the redirect chain (auto-login -> login?externalAuthToken=… ->
 # /api/v1/users/token -> /) to complete with margin for slow
 # networks, but short enough that a logged-out owner gets
-# re-trampolined the next time they visit the page after their
+# re-bounced the next time they visit the page after their
 # explicit logout.
 SSO_MARKER_TTL_SEC = 5 * 60
 
@@ -169,7 +163,7 @@ ALWAYS_STRIP_HEADERS = frozenset(
 )
 
 # ---------------------------------------------------------------------------
-# Federation surface — paths that NEVER trigger the trampoline.
+# Federation surface — paths that NEVER trigger the SSO bounce.
 #
 # These are the URL families a remote ActivityPub server, a federated
 # video player on another instance, or an anonymous web viewer needs
@@ -177,12 +171,12 @@ ALWAYS_STRIP_HEADERS = frozenset(
 # trust headers and do not stamp Authorization on these paths.
 #
 # We don't NEED to enumerate every public path here — for an anonymous
-# visitor with no zone_auth cookie, the trampoline isn't triggered
-# anyway, so the bypass list is only relevant to OWNER traffic.  But
-# being explicit about which paths skip the trampoline avoids
-# surprising a Mastodon-server-behind-its-own-zone or an owner who
-# happens to be following another zone account into accidentally
-# bouncing through the SSO flow when they request remote content.
+# visitor with no zone_auth cookie, the bounce isn't triggered anyway,
+# so the bypass list is only relevant to OWNER traffic.  But being
+# explicit about which paths skip the bounce avoids surprising a
+# Mastodon-server-behind-its-own-zone or an owner who happens to be
+# following another zone account into accidentally bouncing through
+# the SSO flow when they request remote content.
 # ---------------------------------------------------------------------------
 FEDERATION_PATH_PATTERNS = [
     # ActivityPub actor/object surface, per the upstream docs at
@@ -194,8 +188,8 @@ FEDERATION_PATH_PATTERNS = [
     # is the canonical Video object IRI, ``/videos/embed`` is the
     # iframe-embeddable player).  ``/videos/upload`` and
     # ``/videos/manage`` are SPA admin routes that benefit from
-    # the trampoline; including them under a wildcard would skip
-    # the trampoline incorrectly.
+    # the SSO bounce; including them under a wildcard would skip
+    # the bounce incorrectly.
     re.compile(r"^/accounts(/|$)"),
     re.compile(r"^/video-channels(/|$)"),
     re.compile(r"^/videos/watch(/|$)"),
@@ -224,8 +218,8 @@ FEDERATION_PATH_PATTERNS = [
     re.compile(r"^/plugins/auth-openhost-sso(/|$)"),
     # SPA assets — anonymous viewers need these to load the
     # client.  Asset paths are loaded with Accept: */* anyway so
-    # the trampoline filter wouldn't fire on them, but listing
-    # them explicitly is documentation-as-code.
+    # the bounce filter wouldn't fire on them, but listing them
+    # explicitly is documentation-as-code.
     re.compile(r"^/client(/|$)"),
     re.compile(r"^/themes(/|$)"),
     re.compile(r"^/plugins(/|$)"),

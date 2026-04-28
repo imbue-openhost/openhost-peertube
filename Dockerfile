@@ -65,12 +65,11 @@ RUN apt-get update \
 
 # Dedicated unprivileged user/group for the auth-proxy sidecar.
 # We don't share the ``nobody`` user with Caddy because Caddy is
-# also long-lived in this container and we want the auth-proxy's
-# admin-password.txt to be readable ONLY by the auth-proxy
-# process — not by every other "running as nobody" process.
-# A dedicated user keeps the principle of least privilege: even
-# if Caddy gets a remote-code execution bug, it can't read the
-# PeerTube admin credential.
+# also long-lived in this container and process isolation is
+# easier to reason about when each daemon owns its own UID — a
+# compromise of one process cannot read another's data files.
+# General principle of least privilege; the sidecar itself holds
+# no secrets (it just verifies a JWT against a public-key JWKS).
 RUN groupadd --system openhost-authproxy \
  && useradd --system --no-create-home --shell /usr/sbin/nologin \
         --gid openhost-authproxy openhost-authproxy
@@ -109,11 +108,19 @@ COPY start.sh /opt/openhost-peertube/start.sh
 COPY Caddyfile /opt/openhost-peertube/Caddyfile
 COPY auth_proxy.py /opt/openhost-peertube/auth_proxy.py
 COPY peertube-plugin-auth-openhost-sso /opt/openhost-peertube/peertube-plugin-auth-openhost-sso
+
+# Fix permissions on the bundled bits.  The plugin install API
+# hands the path to PeerTube which calls ``pnpm add file:<path>``;
+# pnpm runs as the peertube user so the plugin source dir must
+# be readable by that user.  ``/opt/...`` is root-owned by
+# default after COPY.
+#
+# The shell continuations here do NOT have intervening comments —
+# Docker treats a comment line inside a continued RUN as the end
+# of the RUN command, which would silently drop everything after
+# the first line.  Keep all the comments out of the RUN and use
+# `\` only between actual command tokens.
 RUN chmod +x /opt/openhost-peertube/start.sh \
- # The plugin install API hands the path to PeerTube which calls
- # ``pnpm add file:<path>``.  pnpm runs as the peertube user so
- # the path must be readable by that user.  /opt/...-sso is
- # owned by root by default; chown so peertube can read.
  && chown -R peertube:peertube \
         /opt/openhost-peertube/peertube-plugin-auth-openhost-sso
 

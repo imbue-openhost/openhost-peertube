@@ -37,8 +37,10 @@
 #   * redis-server
 #   * the PeerTube node process
 #   * Caddy (Host-header rewriter, sits between auth-proxy and PeerTube)
-#   * auth-proxy.py (OpenHost zone_auth → PeerTube OAuth2 SSO bridge,
-#     the only listener on the public-facing port)
+#   * auth-proxy.py (the only listener on the public-facing port;
+#     verifies zone_auth on owner HTML navigations and 302-bounces
+#     to the in-PeerTube SSO plugin's auto-login route, otherwise
+#     reverse-proxies straight through to Caddy)
 
 set -euo pipefail
 
@@ -727,57 +729,158 @@ case "$PT_HTTPS:$PT_PORT" in
 esac
 
 # Wait for /api/v1/oauth-clients/local to respond — first-boot
-# Sequelize sync can lag the TCP-listen by ~30s.
+# Sequelize sync can lag the TCP-listen by ~30s.  We poll up to
+# 120 seconds in 1-second increments and explicitly fail if
+# PeerTube never becomes ready, instead of falling through to
+# the next curl with an empty / error body that would only
+# surface as an opaque KeyError further down.
 log "Waiting for PeerTube /api/v1/oauth-clients/local"
-for _ in $(seq 1 60); do
+PT_API_READY=0
+for _ in $(seq 1 120); do
     code=$(curl -sS -o /dev/null -w '%{http_code}' \
         -H "Host: $CANONICAL_HOST" \
         "$PT_LOOPBACK/api/v1/oauth-clients/local" || true)
     if [[ "$code" == "200" ]]; then
+        PT_API_READY=1
         break
     fi
     sleep 1
 done
+if [[ "$PT_API_READY" -ne 1 ]]; then
+    log "FATAL: PeerTube /api/v1/oauth-clients/local never returned 200 in 120s"
+    early_exit_teardown
+    exit 1
+fi
 
+# Helper: parse a JSON path from stdin and emit the value.  Wraps
+# the python3 inline so a non-JSON / unexpected-shape upstream
+# response surfaces as a clean operator-readable FATAL log line
+# rather than an opaque KeyError traceback that the supervisor
+# captures further along.  The path is a list of keys/indices
+# (passed as separate argv entries) so callers don't have to
+# string-mangle their own JSON path.
+parse_json_field() {
+    # Args: a stream-friendly description for logs ("plugins.list"
+    # etc.), then 1+ keys describing the path.  Reads JSON from
+    # stdin; emits the leaf value to stdout.  On any failure
+    # returns 1 and logs FATAL — caller should propagate via
+    # early_exit_teardown + exit.
+    local label="$1"
+    shift
+    python3 - "$label" "$@" <<'PYEOF'
+import json, sys
+label = sys.argv[1]
+keys = sys.argv[2:]
+try:
+    data = json.load(sys.stdin)
+except json.JSONDecodeError as exc:
+    sys.stderr.write(f"[openhost-peertube] FATAL: {label}: response is not JSON: {exc}\n")
+    sys.exit(1)
+node = data
+for k in keys:
+    try:
+        if isinstance(node, list):
+            node = node[int(k)]
+        else:
+            node = node[k]
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        sys.stderr.write(
+            f"[openhost-peertube] FATAL: {label}: missing key {k!r} "
+            f"(have keys={list(node.keys()) if isinstance(node, dict) else type(node).__name__})\n"
+        )
+        sys.exit(1)
+if not isinstance(node, (str, int, float)):
+    sys.stderr.write(
+        f"[openhost-peertube] FATAL: {label}: leaf value is "
+        f"{type(node).__name__}, expected scalar\n"
+    )
+    sys.exit(1)
+print(node)
+PYEOF
+}
+
+# Fetch + parse the OAuth client_id/client_secret.  Stash the
+# JSON body in a variable first so we can run two parses against
+# the SAME response; a per-parse curl invocation could race a
+# client-creds rotation (rare but possible — PeerTube rotates
+# the local client creds across restarts).
 OAUTH_CLIENT_JSON=$(curl -sS \
     -H "Host: $CANONICAL_HOST" \
     "$PT_LOOPBACK/api/v1/oauth-clients/local")
-PT_CLIENT_ID=$(printf '%s' "$OAUTH_CLIENT_JSON" | \
-    python3 -c "import json,sys; print(json.load(sys.stdin)['client_id'])")
-PT_CLIENT_SECRET=$(printf '%s' "$OAUTH_CLIENT_JSON" | \
-    python3 -c "import json,sys; print(json.load(sys.stdin)['client_secret'])")
+PT_CLIENT_ID=$(printf '%s' "$OAUTH_CLIENT_JSON" | parse_json_field oauth-clients.local client_id) || {
+    early_exit_teardown
+    exit 1
+}
+PT_CLIENT_SECRET=$(printf '%s' "$OAUTH_CLIENT_JSON" | parse_json_field oauth-clients.local client_secret) || {
+    early_exit_teardown
+    exit 1
+}
 
 # POST to /api/v1/users/token with grant_type=password.  Pass the
 # admin password through stdin (--data-binary @-) so it never
 # lands in argv.
-TOKEN_JSON=$(printf 'client_id=%s&client_secret=%s&grant_type=password&response_type=code&username=root&password=%s' \
-        "$PT_CLIENT_ID" "$PT_CLIENT_SECRET" "$PT_ADMIN_PW" \
+#
+# URL-encoding: the form-urlencoded body MUST escape any reserved
+# characters (``+ = & %``) in the field values.  ``PT_ADMIN_PW``
+# is generated from ``openssl rand -base64 18 | tr -d '=+/\n'``
+# (see gen_secret() above) so it can ONLY contain the unreserved
+# base64 alphabet minus =+/ — i.e. ``[A-Za-z0-9]`` — which is
+# percent-encoding-safe verbatim.  But we still encode every
+# field defensively because:
+#  * client_id / client_secret are PeerTube-generated random
+#    strings; the upstream code uses ``crypto.randomBytes`` →
+#    base64 encoded, so they too can carry =+/ that would
+#    fail to parse on the server.
+#  * a future change to gen_secret() that enables a different
+#    alphabet must NOT silently break this code path.
+url_encode() {
+    python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
+}
+TOKEN_BODY=$(printf 'client_id=%s&client_secret=%s&grant_type=password&response_type=code&username=root&password=%s' \
+    "$(url_encode "$PT_CLIENT_ID")" \
+    "$(url_encode "$PT_CLIENT_SECRET")" \
+    "$(url_encode "$PT_ADMIN_PW")")
+TOKEN_JSON=$(printf '%s' "$TOKEN_BODY" \
     | curl -sS \
         -H "Host: $CANONICAL_HOST" \
         -H "Content-Type: application/x-www-form-urlencoded" \
         --data-binary @- \
         "$PT_LOOPBACK/api/v1/users/token")
-PT_ACCESS_TOKEN=$(printf '%s' "$TOKEN_JSON" | \
-    python3 -c "import json,sys; print(json.load(sys.stdin)['access_token'])")
-if [[ -z "$PT_ACCESS_TOKEN" ]]; then
+PT_ACCESS_TOKEN=$(printf '%s' "$TOKEN_JSON" | parse_json_field users.token access_token) || {
     log "FATAL: could not obtain PeerTube admin token for plugin install"
     early_exit_teardown
     exit 1
-fi
+}
 
 # Check whether the plugin is already installed.  PeerTube returns
-# {data: [...], total: N}; we check whether any element has the
-# matching npmName.  ``installed`` is the parameterless plugin
-# list (only includes installed/enabled plugins, excluding
-# previously uninstalled ones), so this check is correct on
-# first boot AND on a re-deploy after a previous remove.
-INSTALLED=$(curl -sS \
+# {data: [...], total: N}; we check whether any element of the
+# data array has plugin name ``auth-openhost-sso`` (the
+# short name PeerTube exposes via its admin API — the npmName
+# is the same string with the ``peertube-plugin-`` prefix
+# prepended, but the API returns the short form in the ``name``
+# field).  This check is correct on first boot AND on a
+# re-deploy after a previous remove.
+PLUGIN_LIST_JSON=$(curl -sS \
     -H "Host: $CANONICAL_HOST" \
     -H "Authorization: Bearer $PT_ACCESS_TOKEN" \
-    "$PT_LOOPBACK/api/v1/plugins?count=100" | \
-    python3 -c "import json,sys; d=json.load(sys.stdin); print(any(x['name']=='auth-openhost-sso' for x in d.get('data', [])))")
+    "$PT_LOOPBACK/api/v1/plugins?count=100")
+INSTALLED=$(printf '%s' "$PLUGIN_LIST_JSON" | python3 - <<'PYEOF'
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except json.JSONDecodeError as exc:
+    sys.stderr.write(f"[openhost-peertube] FATAL: plugins.list: response is not JSON: {exc}\n")
+    sys.exit(1)
+items = data.get("data") or []
+hit = any(item.get("name") == "auth-openhost-sso" for item in items if isinstance(item, dict))
+print("yes" if hit else "no")
+PYEOF
+) || {
+    early_exit_teardown
+    exit 1
+}
 
-if [[ "$INSTALLED" == "True" ]]; then
+if [[ "$INSTALLED" == "yes" ]]; then
     log "Plugin auth-openhost-sso already installed"
 else
     log "Installing plugin auth-openhost-sso from $PLUGIN_DIR"

@@ -103,18 +103,19 @@ unchanged — `root` can create unlimited channels (e.g.
 discoverable as a separate ActivityPub actor by remote instances,
 all owned by the same login.
 
-**Why a plugin instead of localStorage trampoline?** An earlier
-revision used a sidecar-served HTML trampoline that minted a
-PeerTube OAuth token and primed `localStorage` directly. That
-approach worked at the API level but failed to fully bootstrap
-the Angular SPA — the SPA's auth state machine reads more
-localStorage keys than the trampoline populated (id, username,
-email, role on top of the access/refresh/type triple), and
-matching the SPA's internal contract against a moving upstream
-is brittle. Routing through the plugin's `registerExternalAuth`
-flow puts ALL the identity-bootstrap responsibility back inside
-PeerTube — which both fixes the bug and removes ~700 lines of
-trampoline-state machinery from the sidecar.
+**Why a plugin instead of header injection?** PeerTube's SPA
+loads its OAuth token from `localStorage`, not from a cookie or
+a request header. Stamping `X-Forwarded-User: root` on every
+proxied request (the openhost-miniflux pattern) doesn't help
+because there's no native PeerTube hook that reads such a
+header. The plugin path uses the only API PeerTube provides for
+"this visitor is the named user, log them in": the
+`registerExternalAuth` callback. PeerTube generates an
+externalAuthToken, redirects to its own login form with that
+token in the query string, and the SPA's standard login flow
+exchanges it for an OAuth pair via `/api/v1/users/token` —
+which means PeerTube's native code is what writes localStorage,
+not us.
 
 #### Threat model / sanity-check
 
@@ -275,14 +276,12 @@ To reset the password later, exec into the container and run:
 cd /app && gosu peertube npm run reset-password -- -u root
 ```
 
-After a password reset, the in-PeerTube SSO plugin still works
-without restart — the plugin doesn't hold the admin password
-anywhere; it relies on PeerTube's `userAuthenticated()` to
-generate the bypass token from the validated owner JWT. (Earlier
-revisions of this package DID cache the admin password in the
-auth-proxy sidecar and required a container restart after a
-password reset; the move to PeerTube's native external-auth API
-removed that coupling.)
+A password reset doesn't disturb the SSO flow: the SSO plugin
+authenticates the owner against the OpenHost router's JWKS and
+then calls PeerTube's `userAuthenticated()` helper, neither of
+which involves the admin password. Resetting the password only
+affects the `root` + password login form (the break-glass path
+above and the path the PeerTube mobile app uses).
 
 ## What's not configured
 
