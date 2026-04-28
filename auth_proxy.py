@@ -591,6 +591,43 @@ class PeerTubeOauthBridge:
             self._client_secret = csec
         return cid, csec
 
+    def fetch_user_info(self, access_token: str, token_type: str) -> dict:
+        """Fetch /api/v1/users/me with the freshly-minted token.
+
+        Returns the parsed JSON response (a dict containing at least
+        ``id``, ``username``, ``email``, ``role.id``).  Raises on any
+        error; caller logs.
+
+        The SPA's bootstrap (``loadUser`` in main.js) refuses to
+        rebuild an authenticated user state from localStorage unless
+        BOTH the OAuth tokens AND four user-identity fields
+        (``id``, ``username``, ``email``, ``role``) are present.
+        Without the user-identity fields the visitor sees the
+        anonymous UI even though tokens are valid — so we must
+        prime them via /users/me as part of the trampoline mint.
+        """
+        url = self._peertube_url("/api/v1/users/me")
+        headers = self._request_headers()
+        # PeerTube's auth uses the standard ``Authorization: Bearer
+        # <access_token>`` scheme; ``token_type`` is "Bearer" in
+        # practice but we honour what the upstream returned in case
+        # a future PeerTube version uses a different scheme name.
+        headers["Authorization"] = f"{token_type} {access_token}"
+        try:
+            with requests.get(url, headers=headers, timeout=10) as resp:
+                resp.raise_for_status()
+                data = resp.json()
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise RuntimeError(
+                "PeerTube /users/me returned non-JSON response"
+            ) from exc
+        if not isinstance(data, dict):
+            raise RuntimeError(
+                f"PeerTube /users/me response is not a JSON object "
+                f"(got {type(data).__name__})"
+            )
+        return data
+
     def mint_token(self) -> dict:
         """Mint a new OAuth2 access token for the configured user.
 
@@ -950,12 +987,26 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
     return resp.json();
   }}).then(function (tokens) {{
     try {{
-      // Match the exact localStorage keys PeerTube's SPA reads —
-      // see /app/client/src/root-helpers/users/oauth-user-tokens.ts
+      // Match the exact localStorage keys PeerTube's SPA reads.
+      // The SPA's bootstrap (``loadUser`` in main.js) needs BOTH
+      // the OAuth token triple AND the four user-identity fields
+      // (id, username, email, role) — if any are missing the
+      // visitor is treated as anonymous on next render.  See
+      // /app/client/src/root-helpers/users/oauth-user-tokens.ts
       // and user-local-storage-keys.ts in the upstream tree.
       window.localStorage.setItem('access_token', tokens.access_token);
       window.localStorage.setItem('refresh_token', tokens.refresh_token);
       window.localStorage.setItem('token_type', tokens.token_type || 'Bearer');
+      // ``role`` is stored as the role-ID integer, stringified —
+      // the SPA's getLoggedInUser does parseInt(stored, 10).
+      // ``id`` is stored the same way.  Mismatching the stringify
+      // (e.g. storing the role *label* rather than the integer ID)
+      // makes the SPA think the user has the "Unknown" role and
+      // hides admin UI.
+      window.localStorage.setItem('id', String(tokens.user.id));
+      window.localStorage.setItem('username', tokens.user.username);
+      window.localStorage.setItem('email', tokens.user.email);
+      window.localStorage.setItem('role', String(tokens.user.role_id));
     }} catch (e) {{
       showError('Could not write OAuth token to localStorage. ' +
                 'Private-mode browsing? Continuing anonymously…');
@@ -1113,6 +1164,52 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
         marker_lifetime = max(60, expires_in - SSO_MARKER_SAFETY_MARGIN_SEC)
         marker_until = int(time.time() + marker_lifetime)
 
+        # Fetch user-identity fields (id/username/email/role) from
+        # /users/me so the trampoline can prime the SPA's
+        # localStorage with everything ``loadUser`` needs.  Without
+        # these the SPA boots as anonymous even with valid tokens
+        # (the SPA's ``loadUser`` short-circuits when ``M.USERNAME``
+        # is missing from localStorage).  See bundle inspection
+        # results for the full storage-key list.
+        try:
+            me = self.oauth_bridge.fetch_user_info(
+                access_token=tokens["access_token"],
+                token_type=tokens["token_type"],
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("PeerTube /users/me fetch failed: %s", exc)
+            self._sso_json_response(
+                502,
+                {"error": "userinfo_failed"},
+                marker_until=_failure_marker(),
+            )
+            return
+
+        # Extract the four required identity fields with defensive
+        # guards so a buggy/compromised upstream doesn't take down
+        # the trampoline with a TypeError.  All four are required
+        # by the SPA's ``getLoggedInUser`` reader; if any is missing
+        # we fail closed.
+        try:
+            user_id = int(me["id"])
+            username = str(me["username"])
+            email = str(me["email"])
+            role_obj = me.get("role")
+            if not isinstance(role_obj, dict) or "id" not in role_obj:
+                raise KeyError("role.id")
+            role_id = int(role_obj["id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            log.warning(
+                "PeerTube /users/me missing/malformed identity fields: %s",
+                exc,
+            )
+            self._sso_json_response(
+                502,
+                {"error": "userinfo_malformed"},
+                marker_until=_failure_marker(),
+            )
+            return
+
         # Send the success response through ``_sso_json_response``
         # so HEAD handling, Content-Length, CRLF-injection-proof
         # marker-cookie construction, and OSError robustness all
@@ -1124,6 +1221,12 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                 "refresh_token": tokens["refresh_token"],
                 "token_type": tokens["token_type"],
                 "expires_in": expires_in,
+                "user": {
+                    "id": user_id,
+                    "username": username,
+                    "email": email,
+                    "role_id": role_id,
+                },
             },
             marker_until=marker_until,
         )
