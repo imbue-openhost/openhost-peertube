@@ -30,6 +30,17 @@
 # We use `wait -n` so a single failed child takes the whole
 # container down and OpenHost notices and restarts us. That
 # requires bash, not /bin/sh.
+#
+# Long-lived children supervised here:
+#   * postgres (started via pg_ctl, not a direct shell child;
+#     watched by a separate poller that signals us if it dies)
+#   * redis-server
+#   * the PeerTube node process
+#   * Caddy (Host-header rewriter, sits between auth-proxy and PeerTube)
+#   * auth-proxy.py (the only listener on the public-facing port;
+#     verifies zone_auth on owner HTML navigations and 302-bounces
+#     to the in-PeerTube SSO plugin's auto-login route, otherwise
+#     reverse-proxies straight through to Caddy)
 
 set -euo pipefail
 
@@ -42,6 +53,21 @@ PG_DATA="$PERSIST/postgres"
 REDIS_DIR="$PERSIST/redis"
 PEERTUBE_DATA_DIR="$PERSIST/peertube-data"
 SECRETS_DIR="$PERSIST/secrets"
+
+# Internal port layout (every listener binds 127.0.0.1 only;
+# only the auth-proxy listens on 0.0.0.0:9000 because that's the
+# port openhost.toml advertises and the OpenHost router connects
+# to from outside the rootless network namespace).
+#
+#     auth-proxy   :9000   ── public, OpenHost-facing
+#       │
+#       ▼
+#     Caddy        :9090   ── loopback, rewrites Host header
+#       │
+#       ▼
+#     PeerTube     :9001   ── loopback, the actual node app
+AUTH_PROXY_LISTEN_PORT=9000
+CADDY_PORT=9090
 
 mkdir -p "$PERSIST" "$TEMP" \
          "$PEERTUBE_DATA_DIR" \
@@ -385,7 +411,8 @@ stop_postgres() {
 # they hit a failure. Variables not yet assigned are absorbed
 # by `${...:-}` so `set -u` doesn't trip.
 early_exit_teardown() {
-    for child in "${PEERTUBE_PID:-}" "${REDIS_PID:-}" "${CADDY_PID:-}"; do
+    for child in "${PEERTUBE_PID:-}" "${REDIS_PID:-}" \
+                 "${CADDY_PID:-}" "${AUTH_PROXY_PID:-}"; do
         if [[ -n "$child" ]]; then
             kill -TERM "$child" 2>/dev/null || true
         fi
@@ -453,9 +480,10 @@ export PEERTUBE_REDIS_HOSTNAME=127.0.0.1
 export PEERTUBE_REDIS_PORT=6379
 export PEERTUBE_REDIS_AUTH="$REDIS_PASSWORD"
 
-# PeerTube runs on 9001 internally; Caddy on 9000 fronts it
-# and rewrites the Host header (see ./Caddyfile and the
-# README.md "Why Caddy" section).
+# PeerTube runs on 9001 internally; the auth-proxy on 9000 fronts
+# Caddy on 9090 fronts PeerTube on 9001 (see openhost.toml + the
+# README.md "Auth model" section for the full topology and the
+# rationale for the auth-proxy mid-tier).
 #
 # The v7.3.0 production image's custom-environment-variables.yaml
 # does NOT map PEERTUBE_LISTEN_PORT — that mapping was added on
@@ -607,12 +635,13 @@ fi
 log "PeerTube is listening; bringing up Caddy"
 
 # -----------------------------------------------------------------
-# Start Caddy (host-rewriter front-door)
+# Start Caddy (host-rewriter mid-tier)
 # -----------------------------------------------------------------
-# Caddy binds :9000 — the port advertised in openhost.toml — and
-# proxies every request to PeerTube on 127.0.0.1:9001 with the
-# Host header reconstituted from X-Forwarded-Host. This satisfies
-# PeerTube's hard-coded canonical-Host check on
+# Caddy binds :9090 (loopback only — the auth-proxy sidecar is
+# what actually listens on the OpenHost-router-facing port 9000)
+# and proxies every request to PeerTube on 127.0.0.1:9001 with
+# the Host header reconstituted from X-Forwarded-Host. This
+# satisfies PeerTube's hard-coded canonical-Host check on
 # /api/v1/oauth-clients/local without needing to dig that
 # behaviour out of upstream.
 #
@@ -620,7 +649,7 @@ log "PeerTube is listening; bringing up Caddy"
 # yet another running-as-root daemon. The bookworm package ships
 # a `caddy` system user we could use, but `nobody` is universal
 # and Caddy doesn't need persistent state for this config.
-log "Starting Caddy host-rewriter on :9000 -> :9001"
+log "Starting Caddy host-rewriter on :${CADDY_PORT} -> :9001"
 # Caddy uses XDG_CONFIG_HOME / XDG_DATA_HOME to find a writable
 # directory for autosave state. Under `runuser -u nobody` the
 # default points at /nonexistent which (correctly) doesn't
@@ -649,13 +678,438 @@ if ! kill -0 "$CADDY_PID" 2>/dev/null; then
 fi
 
 # -----------------------------------------------------------------
+# Install + configure the OpenHost SSO PeerTube plugin
+# -----------------------------------------------------------------
+# The plugin lives in /opt/openhost-peertube/peertube-plugin-auth-openhost-sso/
+# (copied in by the Dockerfile) and is installed into the running
+# PeerTube via the standard plugin admin API.  Mirroring the
+# pattern openhost-miniflux uses for AUTH_PROXY_HEADER and
+# openhost-plane.so uses for its check-session sidecar:
+# the app's own auth machinery is what logs the user in.  The
+# sidecar's only job is bouncing the owner browser to the
+# plugin's auto-login URL on owner navigations whose
+# request doesn't already carry the bounce-marker cookie —
+# typically the first visit, but also any subsequent visit
+# after the marker's 5-minute TTL has elapsed (or after the
+# owner explicitly logs out and the SPA clears its tokens).
+#
+# We talk to the PeerTube admin API as the root user using the
+# admin password generated above.  Idempotent: we read the
+# current plugin list first and skip install if already present.
+# Same for the openhost-router-url setting — we always re-PUT it
+# because OPENHOST_ROUTER_URL can change across container
+# restarts (e.g. when the operator moves to a new host).
+
+export PLUGIN_DIR=/opt/openhost-peertube/peertube-plugin-auth-openhost-sso
+PLUGIN_NPM_NAME=peertube-plugin-auth-openhost-sso
+
+if [[ -z "${OPENHOST_ROUTER_URL:-}" ]]; then
+    log "FATAL: \$OPENHOST_ROUTER_URL is not set; the SSO plugin needs it"
+    log "  to fetch the OpenHost router's JWKS for owner JWT verification."
+    log "  This variable is normally injected by OpenHost; if it isn't,"
+    log "  the openhost-core deployment is broken."
+    early_exit_teardown
+    exit 1
+fi
+
+# Mint a short-lived OAuth token for the local root user — exactly
+# the same flow PeerTube's own admin UI uses on login.  The token
+# is good for ~24h; we use it for a few seconds and let it expire
+# naturally.
+log "Minting admin OAuth token for plugin install"
+PT_LOOPBACK="http://127.0.0.1:9001"
+
+# Helper: curl with the canonical Host header so PeerTube's
+# /api/v1/oauth-clients/local handler accepts the request.  That
+# endpoint enforces a strict Host == webserver.hostname check;
+# the loopback connect would otherwise fail with 403.
+case "$PT_HTTPS:$PT_PORT" in
+    true:443|false:80)
+        CANONICAL_HOST="$PT_HOSTNAME"
+        ;;
+    *)
+        CANONICAL_HOST="$PT_HOSTNAME:$PT_PORT"
+        ;;
+esac
+
+# Wait for /api/v1/oauth-clients/local to respond — first-boot
+# Sequelize sync can lag the TCP-listen by ~30s.  We poll up to
+# 120 seconds in 1-second increments and explicitly fail if
+# PeerTube never becomes ready, instead of falling through to
+# the next curl with an empty / error body that would only
+# surface as an opaque KeyError further down.
+log "Waiting for PeerTube /api/v1/oauth-clients/local"
+PT_API_READY=0
+for _ in $(seq 1 120); do
+    code=$(curl -sS -o /dev/null -w '%{http_code}' \
+        -H "Host: $CANONICAL_HOST" \
+        "$PT_LOOPBACK/api/v1/oauth-clients/local" || true)
+    if [[ "$code" == "200" ]]; then
+        PT_API_READY=1
+        break
+    fi
+    sleep 1
+done
+if [[ "$PT_API_READY" -ne 1 ]]; then
+    log "FATAL: PeerTube /api/v1/oauth-clients/local never returned 200 in 120s"
+    early_exit_teardown
+    exit 1
+fi
+
+# Helper: parse a JSON path from stdin and emit the value.  Wraps
+# the python3 inline so a non-JSON / unexpected-shape upstream
+# response surfaces as a clean operator-readable FATAL log line
+# rather than an opaque KeyError traceback that the supervisor
+# captures further along.  The path is a list of keys/indices
+# (passed as separate argv entries) so callers don't have to
+# string-mangle their own JSON path.
+#
+# We pass the script via ``python3 -c`` (NOT ``python3 -`` with a
+# heredoc) because the heredoc form would feed the heredoc into
+# python's stdin, which is the same channel ``json.load`` wants
+# to read the JSON body from.  ``-c`` keeps stdin available for
+# the JSON.
+parse_json_field() {
+    # Args: a stream-friendly description for logs ("plugins.list"
+    # etc.), then 1+ keys describing the path.  Reads JSON from
+    # stdin; emits the leaf value to stdout.  On any failure
+    # returns 1 and logs FATAL — caller should propagate via
+    # early_exit_teardown + exit.
+    local label="$1"
+    shift
+    python3 -c '
+import json, sys
+label = sys.argv[1]
+keys = sys.argv[2:]
+try:
+    data = json.load(sys.stdin)
+except json.JSONDecodeError as exc:
+    sys.stderr.write(f"[openhost-peertube] FATAL: {label}: response is not JSON: {exc}\n")
+    sys.exit(1)
+node = data
+for k in keys:
+    try:
+        if isinstance(node, list):
+            node = node[int(k)]
+        else:
+            node = node[k]
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        sys.stderr.write(
+            f"[openhost-peertube] FATAL: {label}: missing key {k!r} "
+            f"(have keys={list(node.keys()) if isinstance(node, dict) else type(node).__name__})\n"
+        )
+        sys.exit(1)
+if not isinstance(node, (str, int, float)):
+    sys.stderr.write(
+        f"[openhost-peertube] FATAL: {label}: leaf value is "
+        f"{type(node).__name__}, expected scalar\n"
+    )
+    sys.exit(1)
+print(node)
+' "$label" "$@"
+}
+
+# HTTP helper: send a request to PeerTube on the loopback,
+# capture the body + status code, and surface non-2xx / transport
+# failures as clean FATAL log lines (returning 1) instead of
+# letting ``set -e`` abort the script with no context and orphan
+# the rest of the supervised children.
+#
+# Usage:
+#     body=$(pt_curl <label> <method> <bearer-or-empty> <url> \
+#                     <ok-codes> [<content-type>] [<body>])
+#
+#  * ``label``        — short identifier for the FATAL log line.
+#  * ``method``       — HTTP method (GET/POST/PUT/DELETE...).
+#  * ``bearer``       — empty string or the OAuth access token.
+#  * ``url``          — full URL.
+#  * ``ok-codes``     — space-separated HTTP codes treated as
+#                       success.  Anything else is a FATAL.
+#  * ``content-type`` — optional; required for methods with bodies.
+#  * ``body``         — optional request body, fed to curl on
+#                       stdin via ``--data-binary @-`` so the
+#                       value never lands in argv (and therefore
+#                       /proc/<pid>/cmdline).
+#
+# stderr is left attached to the parent's stderr (curl with -sS
+# emits transport-error diagnostics there); we deliberately do
+# NOT merge stderr into the captured stdout because doing so
+# could let a curl warning printed AFTER the HTTP body throw
+# off the response splitter, which extracts the HTTP code as
+# the LAST line of stdout.  Transport failures still surface
+# via curl's non-zero exit code, which we check.
+pt_curl() {
+    local label="$1" method="$2" bearer="$3" url="$4" ok_codes="$5"
+    local content_type="${6:-}"
+    local body="${7-}"
+
+    # Per-call timeout.  Default 30s is enough for the OAuth
+    # token mint and the settings PUT.  The plugin-install call
+    # legitimately takes much longer because PeerTube's
+    # ``pnpm add file:<path>`` reaches the npm registry to pull
+    # the plugin's runtime deps; callers override the default
+    # via the ``PT_CURL_MAX_TIME`` env var when they need more.
+    local max_time="${PT_CURL_MAX_TIME:-30}"
+
+    local -a curl_args=(curl -sS -w '\n%{http_code}'
+        --connect-timeout 10
+        --max-time "$max_time"
+        -X "$method"
+        -H "Host: $CANONICAL_HOST")
+    if [[ -n "$bearer" ]]; then
+        curl_args+=(-H "Authorization: Bearer $bearer")
+    fi
+    if [[ -n "$content_type" ]]; then
+        curl_args+=(-H "Content-Type: $content_type")
+    fi
+    if [[ $# -ge 7 ]]; then
+        curl_args+=(--data-binary @-)
+    fi
+    curl_args+=("$url")
+
+    # Capture the substitution exit status without ``set -e``
+    # killing the script before our explicit FATAL-log path runs.
+    # Bash's ``set -e`` exits on a non-zero command substitution
+    # in a plain assignment; the ``|| status=$?`` idiom (with
+    # ``status`` initialised to 0) absorbs the failure into a
+    # variable while still letting us branch on it explicitly.
+    local raw status=0
+    if [[ $# -ge 7 ]]; then
+        raw=$(printf '%s' "$body" | "${curl_args[@]}") || status=$?
+    else
+        raw=$("${curl_args[@]}") || status=$?
+    fi
+    if [[ $status -ne 0 ]]; then
+        log "FATAL: $label: curl transport failure (exit $status)"
+        return 1
+    fi
+    local code resp
+    code="${raw##*$'\n'}"
+    resp="${raw%$'\n'*}"
+
+    local matched=0
+    for ok in $ok_codes; do
+        if [[ "$code" == "$ok" ]]; then matched=1; break; fi
+    done
+    if [[ $matched -ne 1 ]]; then
+        log "FATAL: $label: HTTP $code (expected one of: $ok_codes): $resp"
+        return 1
+    fi
+    printf '%s' "$resp"
+}
+
+# Fetch + parse the OAuth client_id/client_secret.  Stash the
+# JSON body in a variable first so we can run two parses against
+# the SAME response; a per-parse curl invocation could race a
+# client-creds rotation (rare but possible — PeerTube rotates
+# the local client creds across restarts).
+OAUTH_CLIENT_JSON=$(pt_curl "oauth-clients.local" GET "" \
+    "$PT_LOOPBACK/api/v1/oauth-clients/local" "200") || {
+    early_exit_teardown
+    exit 1
+}
+PT_CLIENT_ID=$(printf '%s' "$OAUTH_CLIENT_JSON" | parse_json_field oauth-clients.local client_id) || {
+    early_exit_teardown
+    exit 1
+}
+PT_CLIENT_SECRET=$(printf '%s' "$OAUTH_CLIENT_JSON" | parse_json_field oauth-clients.local client_secret) || {
+    early_exit_teardown
+    exit 1
+}
+
+# POST to /api/v1/users/token with grant_type=password.  Pass the
+# admin password through stdin (--data-binary @-) so it never
+# lands in argv.
+#
+# URL-encoding: the form-urlencoded body MUST escape any reserved
+# characters (``+ = & %``) in the field values.  ``PT_ADMIN_PW``
+# is generated from ``openssl rand -base64 18 | tr -d '=+/\n'``
+# (see gen_secret() above) so it can ONLY contain the unreserved
+# base64 alphabet minus =+/ — i.e. ``[A-Za-z0-9]`` — which is
+# percent-encoding-safe verbatim.  But we still encode every
+# field defensively because:
+#  * client_id / client_secret are PeerTube-generated random
+#    strings; the upstream code uses ``crypto.randomBytes`` →
+#    base64 encoded, so they too can carry =+/ that would
+#    fail to parse on the server.
+#  * a future change to gen_secret() that enables a different
+#    alphabet must NOT silently break this code path.
+url_encode() {
+    # Pass the secret via env var rather than argv so it never
+    # appears in /proc/<pid>/cmdline for the duration of the
+    # python3 process (visible to anyone with read access to
+    # the procfs entry).  Same defensive pattern as the rest
+    # of the file uses for password-bearing commands.
+    URL_ENCODE_INPUT="$1" python3 -c '
+import os, urllib.parse
+print(urllib.parse.quote(os.environ["URL_ENCODE_INPUT"], safe=""))
+'
+}
+TOKEN_BODY=$(printf 'client_id=%s&client_secret=%s&grant_type=password&response_type=code&username=root&password=%s' \
+    "$(url_encode "$PT_CLIENT_ID")" \
+    "$(url_encode "$PT_CLIENT_SECRET")" \
+    "$(url_encode "$PT_ADMIN_PW")")
+TOKEN_JSON=$(pt_curl "users.token" POST "" \
+    "$PT_LOOPBACK/api/v1/users/token" "200" \
+    "application/x-www-form-urlencoded" "$TOKEN_BODY") || {
+    early_exit_teardown
+    exit 1
+}
+PT_ACCESS_TOKEN=$(printf '%s' "$TOKEN_JSON" | parse_json_field users.token access_token) || {
+    log "FATAL: could not obtain PeerTube admin token for plugin install"
+    early_exit_teardown
+    exit 1
+}
+
+# Check whether the plugin is already installed.  The
+# single-resource lookup ``GET /api/v1/plugins/<npmName>``
+# returns 200 with the plugin's metadata if installed, or 404
+# otherwise — avoids paginating the full plugin list (which
+# could miss us on an instance with hundreds of installed
+# plugins) AND lets us decide install-or-skip from a single
+# request.
+#
+# We accept both 200 and 404 as "not a fatal error".  The body
+# shape disambiguates: PeerTube's plugin object always carries
+# a non-empty ``name`` field, so the presence of that field in
+# a successfully parsed JSON object is the marker for
+# "installed".  An error response (404) is also valid JSON
+# (``{error: ...}``) which lacks ``name``.
+LOOKUP_BODY=$(pt_curl "plugins.lookup" GET "$PT_ACCESS_TOKEN" \
+    "$PT_LOOPBACK/api/v1/plugins/$PLUGIN_NPM_NAME" \
+    "200 404") || {
+    early_exit_teardown
+    exit 1
+}
+INSTALLED=""
+INSTALLED=$(printf '%s' "$LOOKUP_BODY" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except json.JSONDecodeError:
+    print("no")
+    sys.exit(0)
+print("yes" if isinstance(data, dict) and data.get("name") else "no")
+') || {
+    log "FATAL: plugins.lookup: install-state probe crashed"
+    early_exit_teardown
+    exit 1
+}
+if [[ -z "$INSTALLED" ]]; then
+    log "FATAL: plugins.lookup: install-state probe produced empty output"
+    early_exit_teardown
+    exit 1
+fi
+
+if [[ "$INSTALLED" == "yes" ]]; then
+    log "Plugin auth-openhost-sso already installed"
+else
+    log "Installing plugin auth-openhost-sso from $PLUGIN_DIR"
+    INSTALL_PAYLOAD=$(python3 -c 'import json,os; print(json.dumps({"path": os.environ["PLUGIN_DIR"]}))') || {
+        log "FATAL: plugins.install: failed to build request payload"
+        early_exit_teardown
+        exit 1
+    }
+    # Bump the per-call timeout: PeerTube installs plugins via
+    # ``pnpm add file:<path>``, which fetches the plugin's
+    # runtime deps (jsonwebtoken, jwks-rsa) from the npm
+    # registry.  Network round-trips to npm + pnpm's hash
+    # verification dominate the time; 5 minutes is a generous
+    # ceiling that still produces a clean FATAL log on a
+    # genuinely-stuck install instead of hanging boot
+    # indefinitely.
+    PT_CURL_MAX_TIME=300 pt_curl "plugins.install" POST "$PT_ACCESS_TOKEN" \
+        "$PT_LOOPBACK/api/v1/plugins/install" \
+        "200 204" \
+        "application/json" "$INSTALL_PAYLOAD" >/dev/null || {
+        early_exit_teardown
+        exit 1
+    }
+fi
+
+# Always re-set the openhost-router-url setting.  PeerTube
+# accepts a JSON body of {settings: {<name>: <value>}} on
+# PUT /api/v1/plugins/<npmName>/settings.  Even if the value
+# hasn't changed across boots the PUT triggers
+# settingsManager.onSettingsChange in the plugin, which
+# re-builds the JWKS client — useful in case the operator
+# rotated keys on the OpenHost router side without restarting
+# us.
+log "Configuring plugin (router URL: $OPENHOST_ROUTER_URL)"
+SETTINGS_PAYLOAD=$(python3 -c "import json,os; print(json.dumps({'settings': {'openhost-router-url': os.environ['OPENHOST_ROUTER_URL']}}))") || {
+    log "FATAL: plugins.settings: failed to build request payload"
+    early_exit_teardown
+    exit 1
+}
+pt_curl "plugins.settings" PUT "$PT_ACCESS_TOKEN" \
+    "$PT_LOOPBACK/api/v1/plugins/$PLUGIN_NPM_NAME/settings" \
+    "204" \
+    "application/json" "$SETTINGS_PAYLOAD" >/dev/null || {
+    early_exit_teardown
+    exit 1
+}
+
+# -----------------------------------------------------------------
+# Start auth-proxy sidecar (OpenHost zone_auth → SSO bounce)
+# -----------------------------------------------------------------
+# The sidecar binds the public-facing port (9000) on behalf of
+# the OpenHost router.  Two responsibilities:
+#   * Pass-through proxy for federation + anonymous + asset
+#     traffic.
+#   * Owner bounce: when an HTML navigation arrives carrying
+#     a verified ``zone_auth`` cookie and no marker cookie, the
+#     sidecar 302-redirects the browser to the plugin's
+#     auto-login route.  The plugin verifies the same JWT and
+#     calls userAuthenticated, which redirects to
+#     /login?externalAuthToken=… and the SPA finishes the login
+#     via PeerTube's native flow.
+#
+# Runs as a dedicated ``openhost-authproxy`` user (not ``nobody``
+# and not the same user as Caddy).  Least-privilege: isolating
+# every container daemon to its own UID means a compromise of
+# any one process can't read another's data files.
+
+log "Starting auth-proxy sidecar on :${AUTH_PROXY_LISTEN_PORT} -> Caddy :${CADDY_PORT}"
+
+AUTH_PROXY_LOG_LEVEL="${AUTH_PROXY_LOG_LEVEL:-INFO}" \
+AUTH_PROXY_LISTEN_PORT="$AUTH_PROXY_LISTEN_PORT" \
+AUTH_PROXY_UPSTREAM_HOST="127.0.0.1" \
+AUTH_PROXY_UPSTREAM_PORT="$CADDY_PORT" \
+OPENHOST_ROUTER_URL="$OPENHOST_ROUTER_URL" \
+    runuser -u openhost-authproxy --preserve-environment -- \
+        python3 /opt/openhost-peertube/auth_proxy.py &
+AUTH_PROXY_PID=$!
+
+# Wait for the auth-proxy to bind :9000.  Same probe pattern as
+# Caddy.  If this never comes up the OpenHost router can't reach
+# us at all and the container is unreachable, so fail loudly.
+AP_READY=0
+for _ in $(seq 1 30); do
+    if ! kill -0 "$AUTH_PROXY_PID" 2>/dev/null; then
+        log "FATAL: auth-proxy exited during startup"
+        early_exit_teardown
+        exit 1
+    fi
+    if (echo > /dev/tcp/127.0.0.1/$AUTH_PROXY_LISTEN_PORT) 2>/dev/null; then
+        AP_READY=1
+        break
+    fi
+    sleep 0.5
+done
+if [[ "$AP_READY" -ne 1 ]]; then
+    log "FATAL: auth-proxy didn't bind 127.0.0.1:$AUTH_PROXY_LISTEN_PORT in 15s"
+    early_exit_teardown
+    exit 1
+fi
+
+# -----------------------------------------------------------------
 # Supervisor
 # -----------------------------------------------------------------
-# Forward SIGTERM/SIGINT to all three children + the postgres
-# postmaster. We don't track postmaster's PID directly (pg_ctl
-# starts it as a daemonized child of postgres) so we send the
-# signal via pg_ctl stop on shutdown. Redis and PeerTube have
-# their PIDs.
+# Forward SIGTERM/SIGINT to all four direct children (PeerTube,
+# Redis, Caddy, auth-proxy) plus the postgres postmaster. We
+# don't track postmaster's PID directly (pg_ctl starts it as a
+# daemonized child of postgres) so we send the signal via
+# pg_ctl stop on shutdown. The four others have their PIDs.
 #
 # Renamed from the more obvious `shutdown` to avoid shadowing
 # /usr/sbin/shutdown — a future maintainer who wants to
@@ -677,7 +1131,8 @@ teardown() {
     if [[ -n "$PG_WATCHER_PID" ]]; then
         kill -TERM "$PG_WATCHER_PID" 2>/dev/null || true
     fi
-    kill -TERM "$PEERTUBE_PID" "$REDIS_PID" "$CADDY_PID" 2>/dev/null || true
+    kill -TERM "$PEERTUBE_PID" "$REDIS_PID" "$CADDY_PID" \
+        "$AUTH_PROXY_PID" 2>/dev/null || true
     stop_postgres
     wait || true
 }
@@ -701,15 +1156,19 @@ trap teardown TERM INT
 PG_WATCHER_PID=$!
 
 set +e
-wait -n "$PEERTUBE_PID" "$REDIS_PID" "$CADDY_PID"
+wait -n "$PEERTUBE_PID" "$REDIS_PID" "$CADDY_PID" "$AUTH_PROXY_PID"
 EXIT_CODE=$?
 set -e
 
 # Identify which child died for diagnostics. By the time we get
-# here at least one of the three pids is gone; the others may
+# here at least one of the four pids is gone; the others may
 # still be alive (the supervisor will TERM them in teardown).
 DEAD=""
-for tag_pid in "peertube=$PEERTUBE_PID" "redis=$REDIS_PID" "caddy=$CADDY_PID"; do
+for tag_pid in \
+        "peertube=$PEERTUBE_PID" \
+        "redis=$REDIS_PID" \
+        "caddy=$CADDY_PID" \
+        "auth-proxy=$AUTH_PROXY_PID"; do
     tag="${tag_pid%%=*}"
     pid="${tag_pid##*=}"
     if ! kill -0 "$pid" 2>/dev/null; then

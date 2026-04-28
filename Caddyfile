@@ -1,5 +1,6 @@
-# Tiny Caddy front-door whose only job is to rewrite the Host
-# header before forwarding to PeerTube on the loopback port.
+# Tiny Caddy mid-tier whose only job is to rewrite the Host header
+# from X-Forwarded-Host before forwarding to PeerTube on the
+# loopback port.
 #
 # Background: PeerTube's /api/v1/oauth-clients/local handler
 # explicitly checks `req.headers.host == webserver.hostname[:port]`
@@ -9,15 +10,34 @@
 # proxy that accidentally exposes the local-loopback API to a
 # different vhost).
 #
-# The OpenHost router proxies via httpx and excludes the
-# original Host header, so by the time the request reaches
-# PeerTube the Host is `127.0.0.1:9000` — which never matches
-# the canonical hostname and trips the 403. The router does set
-# X-Forwarded-Host correctly, so we just have to rewrite Host
-# from that header before the request hits PeerTube.
+# Without rewriting, by the time a request reaches PeerTube the
+# Host header is some loopback variant (the OpenHost router and
+# the auth-proxy sidecar above us both forward to us by
+# 127.0.0.1:<their_upstream_port>) — which never matches the
+# canonical hostname and trips the 403. The OpenHost router DOES
+# set X-Forwarded-Host correctly, so we rewrite Host from that
+# header before the request hits PeerTube.  The auth-proxy
+# preserves X-Forwarded-Host on its way through.
 #
-# Caddy listens on :9000 (the port openhost.toml advertises);
-# PeerTube actually runs on :9001 inside the container.
+# Topology:
+#
+#   OpenHost router  →  127.0.0.1:9000  (auth-proxy.py / SSO sidecar)
+#                   →  127.0.0.1:9090  (this Caddy)
+#                   →  127.0.0.1:9001  (PeerTube node)
+#
+# The auth-proxy fronts Caddy because it's the layer that
+# selectively bounces zone owners to the in-PeerTube SSO plugin
+# (peertube-plugin-auth-openhost-sso, installed by start.sh on
+# first boot) and strips X-OpenHost-* trust headers from inbound
+# requests.  Federation traffic, anonymous viewer traffic, and
+# already-authenticated owner traffic all pass through the
+# auth-proxy unchanged; only the first-time owner navigation
+# is bounced to /plugins/auth-openhost-sso/router/auto-login.
+#
+# This Caddy stays in the path because the Host-rewriting job
+# is non-trivial to do safely from Python (we'd have to rebuild
+# the request line and reattach all the X-Forwarded-* headers
+# correctly), and Caddy is rock-solid at it.
 
 {
 	# No admin API, no automatic HTTPS — we are loopback-only.
@@ -34,10 +54,22 @@
 	}
 }
 
-# Listen on the port advertised in openhost.toml. The router
-# proxies to 127.0.0.1:<host_port> which Podman maps to
-# container_port 9000 -> this Caddy.
-:9000 {
+# Caddy listens on 127.0.0.1:9090 — loopback only.  The auth-proxy
+# sidecar sits in front of it on :9000 (the port advertised in
+# openhost.toml) and is the only thing that should reach Caddy.
+# Binding loopback ensures a hostile container neighbour or a
+# misconfigured router can't talk to Caddy directly and skip the
+# auth-proxy's header sanitation.
+#
+# Note on Caddyfile syntax: the site address is plain ``:9090``
+# (matches all Hosts) and the loopback restriction is expressed
+# via the ``bind`` directive.  An address-prefix form like
+# ``127.0.0.1:9090 { ... }`` would be interpreted by Caddy as a
+# Host MATCHER (only respond to requests whose Host header equals
+# ``127.0.0.1``) — which silently breaks all real requests, since
+# our inbound traffic carries Host: 127.0.0.1:9090 (with the port).
+:9090 {
+	bind 127.0.0.1
 	# Rewrite the Host header from X-Forwarded-Host before
 	# proxying to PeerTube on its loopback port. If the header
 	# is absent (which would only happen if something other

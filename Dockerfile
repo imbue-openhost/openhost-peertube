@@ -57,7 +57,22 @@ RUN apt-get update \
         procps \
         util-linux \
         caddy \
+        python3 \
+        python3-jwt \
+        python3-requests \
+        python3-cryptography \
  && rm -rf /var/lib/apt/lists/*
+
+# Dedicated unprivileged user/group for the auth-proxy sidecar.
+# We don't share the ``nobody`` user with Caddy because Caddy is
+# also long-lived in this container and process isolation is
+# easier to reason about when each daemon owns its own UID — a
+# compromise of one process cannot read another's data files.
+# General principle of least privilege; the sidecar itself holds
+# no secrets (it just verifies a JWT against a public-key JWKS).
+RUN groupadd --system openhost-authproxy \
+ && useradd --system --no-create-home --shell /usr/sbin/nologin \
+        --gid openhost-authproxy openhost-authproxy
 
 # Postgres' Debian package ships a "main" cluster auto-created at
 # install time under /var/lib/postgresql/15/main. We don't want
@@ -75,19 +90,56 @@ RUN if [ -d /var/lib/postgresql/15/main ]; then \
 # redis.conf at boot pointing at $OPENHOST_APP_DATA_DIR/redis.
 RUN rm -rf /var/lib/redis/* /etc/redis/redis.conf || true
 
-# Copy our startup wrapper + Caddyfile. start.sh generates
-# DB + Redis + admin passwords on first boot, persists them
-# under $OPENHOST_APP_DATA_DIR, and starts postgres, redis,
-# Caddy (host-rewriter front-door), and the PeerTube node
-# process under a bash supervisor.
+# Copy our startup wrapper + Caddyfile + auth-proxy sidecar +
+# the bundled SSO plugin.
+#
+# start.sh generates DB + Redis + admin passwords on first boot,
+# persists them under $OPENHOST_APP_DATA_DIR, starts postgres,
+# redis, the PeerTube node process, Caddy (host-rewriter
+# mid-tier), and the Python auth-proxy sidecar.  After PeerTube
+# is up, start.sh authenticates as root and installs/configures
+# the bundled ``peertube-plugin-auth-openhost-sso`` plugin via
+# the standard PeerTube admin API — this is the plugin that
+# implements the actual owner-sign-in flow via PeerTube's
+# native ``registerExternalAuth`` machinery.  Five long-lived
+# processes plus the in-PeerTube plugin, supervised by a single
+# bash parent with `wait -n`.
 COPY start.sh /opt/openhost-peertube/start.sh
 COPY Caddyfile /opt/openhost-peertube/Caddyfile
-RUN chmod +x /opt/openhost-peertube/start.sh
+COPY auth_proxy.py /opt/openhost-peertube/auth_proxy.py
+COPY peertube-plugin-auth-openhost-sso /opt/openhost-peertube/peertube-plugin-auth-openhost-sso
+
+# Fix permissions on the bundled bits.  The plugin install API
+# hands the path to PeerTube which calls ``pnpm add file:<path>``;
+# pnpm runs as the peertube user so the plugin source dir must
+# be readable by that user.  ``/opt/...`` is root-owned by
+# default after COPY.
+#
+# The shell continuations here do NOT have intervening comments —
+# Docker treats a comment line inside a continued RUN as the end
+# of the RUN command, which would silently drop everything after
+# the first line.  Keep all the comments out of the RUN and use
+# `\` only between actual command tokens.
+#
+# Note: pnpm fetches the plugin's runtime npm dependencies
+# (jsonwebtoken, jwks-rsa) from the public npm registry on first
+# boot, when PeerTube's plugin-install API runs ``pnpm add
+# file:<path>`` against this directory.  This requires outbound
+# internet access from the container at first-boot time.  The
+# container that runs this image already needs outbound internet
+# (PeerTube fetches video plugin metadata, the OpenHost router
+# does TLS cert provisioning, etc.) so this isn't an additional
+# constraint in practice.
+RUN chmod +x /opt/openhost-peertube/start.sh \
+ && chown -R peertube:peertube \
+        /opt/openhost-peertube/peertube-plugin-auth-openhost-sso
 
 # OpenHost will route http://peertube.<zone>/... to this port.
-# Caddy (the host-rewriter front-door) binds :9000; PeerTube
-# itself listens on the loopback at :9001. See Caddyfile and
-# the start.sh /config/local.yaml override.
+# The auth-proxy sidecar (auth_proxy.py) binds :9000.  Behind it,
+# Caddy on loopback :9090 rewrites the Host header for the SPA's
+# canonical-Host check, and PeerTube itself listens on loopback
+# :9001.  See auth_proxy.py module docstring + Caddyfile + the
+# start.sh /config/local.yaml override.
 EXPOSE 9000
 
 # ENTRYPOINT inherited from the base image is the upstream

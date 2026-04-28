@@ -1,0 +1,26 @@
+{
+  "name": "peertube-plugin-auth-openhost-sso",
+  "description": "OpenHost zone-owner SSO for PeerTube. Verifies a router-issued zone_auth JWT and logs the owner in as the root admin via PeerTube's external-auth flow.",
+  "version": "1.0.0",
+  "author": "OpenHost",
+  "bugs": "https://github.com/imbue-openhost/openhost-peertube/issues",
+  "homepage": "https://github.com/imbue-openhost/openhost-peertube",
+  "engine": {
+    "peertube": ">=5.0.0"
+  },
+  "keywords": [
+    "peertube",
+    "plugin",
+    "auth"
+  ],
+  "library": "./main.js",
+  "staticDirs": {},
+  "css": [],
+  "clientScripts": [],
+  "translations": {},
+  "dependencies": {
+    "jsonwebtoken": "9.0.2",
+    "jwks-rsa": "3.1.0",
+    "jwk-to-pem": "2.0.5"
+  }
+}
