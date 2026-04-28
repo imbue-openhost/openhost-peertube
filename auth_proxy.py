@@ -1138,17 +1138,29 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
         the trampoline on the next owner visit, which in turn will
         replace the stale localStorage tokens.
 
-        We require POST to invalidate the marker.  A bare GET
-        navigation under ``SameSite=Lax`` would carry the
-        ``zone_auth`` cookie (Lax permits top-level GETs from
-        cross-origin), so a malicious cross-site link
-        ``<a href="https://peertube.zone/__openhost-sso/logout">``
-        could clear the marker without the user's consent and force
-        a re-trampoline on their next visit.  Annoying but not a
-        privilege escalation — still cleaner to require POST.
+        Anti-CSRF: we require POST AND a custom header
+        ``X-Requested-With: XMLHttpRequest``.  POST alone isn't
+        enough — a cross-site ``<form method="POST">`` submission
+        IS allowed by SameSite=Lax (Lax blocks cross-site requests
+        that aren't top-level navigations, but a top-level form
+        POST IS a top-level navigation).  Requiring a custom
+        header IS sufficient: HTML forms cannot set arbitrary
+        request headers, only the same Content-Type values a form
+        already supports.  ``XMLHttpRequest`` / ``fetch()`` from
+        same-origin JS can set the custom header without
+        triggering a CORS preflight (because the header value
+        ``XMLHttpRequest`` is on the CORS-safelisted-request-header
+        list under "X-Requested-With").
         """
         if self.command not in ("POST",):
             self._safe_send_error(405, "Method Not Allowed")
+            return
+        xrw = self.headers.get("X-Requested-With", "").strip().lower()
+        if xrw != "xmlhttprequest":
+            log.info(
+                "rejecting /__openhost-sso/logout without X-Requested-With"
+            )
+            self._safe_send_error(403, "X-Requested-With header required")
             return
         # ``_build_marker_cookie`` already gates ``Secure`` on
         # ``X-Forwarded-Proto`` so the unset Set-Cookie addresses
