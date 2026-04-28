@@ -55,16 +55,27 @@ the PeerTube web UI, the auth-proxy:
 2. Redirects the owner to `/__openhost-sso/login`, a tiny static
    HTML page served by the sidecar itself.
 3. That page calls `/__openhost-sso/mint-token` (also sidecar-served),
-   which verifies the JWT a second time and then mints a fresh
-   PeerTube OAuth2 access token by calling PeerTube's own
+   which verifies the JWT a second time, mints a fresh PeerTube
+   OAuth2 access token by calling PeerTube's own
    `/api/v1/oauth-clients/local` and `/api/v1/users/token` over
-   loopback, using the persisted `admin-password.txt` as the
-   service-account credential.
-4. The page writes `access_token`, `refresh_token`, and `token_type`
-   to `localStorage` — the exact keys PeerTube's Angular SPA reads
-   (verified against
-   `/app/client/src/root-helpers/users/oauth-user-tokens.ts`
-   in the upstream tree).
+   loopback (using the persisted `admin-password.txt` as the
+   service-account credential), then calls `/api/v1/users/me` with
+   the minted token to fetch the four identity fields the SPA
+   needs (`id`, `username`, `email`, `role.id`).
+4. The page writes seven items to `localStorage`:
+   - the OAuth token triple (`access_token`, `refresh_token`,
+     `token_type`),
+   - and the four user-identity fields (`id`, `username`, `email`,
+     `role`).
+   These are the exact keys PeerTube's Angular SPA reads on
+   bootstrap. The token triple is verified against
+   `/app/client/src/root-helpers/users/oauth-user-tokens.ts` in
+   the upstream tree; the user-identity quartet is what
+   `getLoggedInUser` in the SPA's user-local-storage service
+   reads — without it the SPA's bootstrap (`loadUser` in
+   `main.js`) treats the visitor as anonymous EVEN with valid
+   tokens. `id` and `role` are stored as stringified integers,
+   matching what the SPA's standard login flow writes.
 5. The sidecar's mint-token response sets a marker cookie
    `openhost_pt_sso_until=<unix-ts>` via `Set-Cookie` (the
    browser-side trampoline JS does not touch the cookie itself —
