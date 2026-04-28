@@ -611,13 +611,17 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
         re-bounce on the way back.
 
         The ``next=`` query param is the original path the visitor
-        was trying to reach — we percent-encode it via
-        ``_safe_next_path`` to defang open-redirect attacks before
-        echoing it.  The plugin currently ignores ``next`` (it
-        always lands on ``/login`` after the externalAuthToken
-        round-trip and then the SPA decides where to navigate),
-        but we pass it through for forward compatibility with a
-        future plugin version that honours it.
+        was trying to reach.  ``_safe_next_path`` validates and
+        sanitises it (rejects absolute URLs, scheme-relative
+        URLs, and other open-redirect shapes) so we never echo
+        an attacker-controlled location back as the bounce
+        target.  ``urllib.parse.urlencode`` then percent-encodes
+        the (already-validated) value into the query string.
+        The plugin currently ignores ``next`` (it always lands
+        on ``/login`` after the externalAuthToken round-trip and
+        then the SPA decides where to navigate), but we pass it
+        through for forward compatibility with a future plugin
+        version that honours it.
         """
         next_url = _safe_next_path(self.path)
         target = SSO_BOUNCE_PATH + "?" + urllib.parse.urlencode({"next": next_url})

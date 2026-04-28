@@ -853,18 +853,19 @@ _pt_curl() {
     fi
     curl_args+=("$url")
 
-    local raw code resp
+    local raw status
     if [[ $# -ge 7 ]]; then
-        raw=$(printf '%s' "$body" | "${curl_args[@]}") || {
-            log "FATAL: $label: curl transport failure (exit $?)"
-            return 1
-        }
+        raw=$(printf '%s' "$body" | "${curl_args[@]}")
+        status=$?
     else
-        raw=$("${curl_args[@]}") || {
-            log "FATAL: $label: curl transport failure (exit $?)"
-            return 1
-        }
+        raw=$("${curl_args[@]}")
+        status=$?
     fi
+    if [[ $status -ne 0 ]]; then
+        log "FATAL: $label: curl transport failure (exit $status)"
+        return 1
+    fi
+    local code resp
     code="${raw##*$'\n'}"
     resp="${raw%$'\n'*}"
 
@@ -955,17 +956,33 @@ PLUGIN_LIST_JSON=$(_pt_curl "plugins.list" GET "$PT_ACCESS_TOKEN" \
     early_exit_teardown
     exit 1
 }
-INSTALLED=$(printf '%s' "$PLUGIN_LIST_JSON" | python3 -c '
-import json, sys
+# We just need a yes/no answer here — extracting the array of
+# names via the existing parse_json_field helper would require
+# n+1 invocations (one to learn the data length, n more to read
+# each name); instead we use a tiny dedicated helper that
+# mirrors parse_json_field's error-handling shape for a
+# membership-test predicate.  Keeps the FATAL-log format
+# identical to the rest of the boot path.
+contains_plugin_named() {
+    # Args: <label> <plugin name to look for>.  Reads JSON from
+    # stdin, prints "yes" or "no" to stdout, exits 1 on parse
+    # failure (same as parse_json_field).
+    local label="$1" want="$2"
+    LABEL="$label" WANT="$want" python3 -c '
+import json, os, sys
+label = os.environ["LABEL"]
+want = os.environ["WANT"]
 try:
     data = json.load(sys.stdin)
 except json.JSONDecodeError as exc:
-    sys.stderr.write(f"[openhost-peertube] FATAL: plugins.list: response is not JSON: {exc}\n")
+    sys.stderr.write(f"[openhost-peertube] FATAL: {label}: response is not JSON: {exc}\n")
     sys.exit(1)
 items = data.get("data") or []
-hit = any(item.get("name") == "auth-openhost-sso" for item in items if isinstance(item, dict))
+hit = any(item.get("name") == want for item in items if isinstance(item, dict))
 print("yes" if hit else "no")
-') || {
+'
+}
+INSTALLED=$(printf '%s' "$PLUGIN_LIST_JSON" | contains_plugin_named "plugins.list" "auth-openhost-sso") || {
     early_exit_teardown
     exit 1
 }
