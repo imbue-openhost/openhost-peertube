@@ -57,6 +57,10 @@ RUN apt-get update \
         procps \
         util-linux \
         caddy \
+        python3 \
+        python3-jwt \
+        python3-requests \
+        python3-cryptography \
  && rm -rf /var/lib/apt/lists/*
 
 # Postgres' Debian package ships a "main" cluster auto-created at
@@ -75,13 +79,18 @@ RUN if [ -d /var/lib/postgresql/15/main ]; then \
 # redis.conf at boot pointing at $OPENHOST_APP_DATA_DIR/redis.
 RUN rm -rf /var/lib/redis/* /etc/redis/redis.conf || true
 
-# Copy our startup wrapper + Caddyfile. start.sh generates
-# DB + Redis + admin passwords on first boot, persists them
-# under $OPENHOST_APP_DATA_DIR, and starts postgres, redis,
-# Caddy (host-rewriter front-door), and the PeerTube node
-# process under a bash supervisor.
+# Copy our startup wrapper + Caddyfile + auth-proxy sidecar.
+# start.sh generates DB + Redis + admin passwords on first boot,
+# persists them under $OPENHOST_APP_DATA_DIR, and starts postgres,
+# redis, Caddy (host-rewriter mid-tier), the PeerTube node
+# process, and the Python auth-proxy sidecar (which sits in front
+# of Caddy and bridges OpenHost's zone_auth cookie to a freshly
+# minted PeerTube OAuth2 token via a one-time client-side
+# trampoline page).  Five long-lived processes total, supervised
+# by a single bash parent with `wait -n`.
 COPY start.sh /opt/openhost-peertube/start.sh
 COPY Caddyfile /opt/openhost-peertube/Caddyfile
+COPY auth_proxy.py /opt/openhost-peertube/auth_proxy.py
 RUN chmod +x /opt/openhost-peertube/start.sh
 
 # OpenHost will route http://peertube.<zone>/... to this port.

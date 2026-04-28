@@ -12,22 +12,108 @@ as a single-container OpenHost app.
 * ffmpeg, invoked on-demand by the PeerTube node process for transcoding
   (it is not a long-lived service)
 
-The four long-lived services — Postgres, Redis, PeerTube, and Caddy —
-are supervised by a small bash parent (`start.sh`) that starts them in
-that order and tears the whole container down if any one exits.
-OpenHost notices the exit and restarts us.
+The five long-lived services — Postgres, Redis, PeerTube, Caddy and
+the auth-proxy sidecar — are supervised by a small bash parent
+(`start.sh`) that starts them in that order and tears the whole
+container down if any one exits. OpenHost notices the exit and
+restarts us.
 
-### Why Caddy?
+### Auth model: anonymous watch + owner SSO via trampoline
 
-PeerTube hard-checks `req.headers.host == webserver.hostname[:port]`
-on its `/api/v1/oauth-clients/local` endpoint and returns 403
-otherwise. The OpenHost router proxies via httpx and strips the
-original Host header (httpx sets it to the upstream URL — i.e.
-`127.0.0.1:9000`) so PeerTube would always 403. The router does set
-`X-Forwarded-Host` correctly, so we run a tiny Caddy on the
-container's exposed port (9000) whose only job is to rewrite the Host
-header from `X-Forwarded-Host` before forwarding to PeerTube on
-loopback :9001. See `Caddyfile` for the config.
+The container's listening surface looks like this:
+
+```
+   OpenHost router (HTTPS)
+       │
+       ▼
+   :9000   auth-proxy sidecar (auth_proxy.py)
+       │   ── trampoline-based owner SSO; pass-through for everyone else
+       ▼
+   :9090   Caddy (Host-header rewriter)
+       │   ── rewrites Host: to X-Forwarded-Host before forwarding
+       ▼
+   :9001   PeerTube node (the actual app)
+```
+
+**Anonymous viewers and federation traffic** pass straight through
+all three layers untouched. The OpenHost zone-level auth gate is
+disabled (`public_paths = ["/"]` in `openhost.toml`) because remote
+ActivityPub servers cannot present a `zone_auth` cookie — gating
+federation paths would break inbound follows, video discovery,
+comment delivery, and HLS streaming to remote viewers.
+
+**The zone owner** (anyone holding a router-issued `zone_auth` JWT
+cookie) gets a different experience. When the owner navigates to
+the PeerTube web UI, the auth-proxy:
+
+1. Verifies the `zone_auth` cookie against the OpenHost router's
+   JWKS (RS256, `sub == "owner"`).
+2. Redirects the owner to `/__openhost-sso/login`, a tiny static
+   HTML page served by the sidecar itself.
+3. That page calls `/__openhost-sso/mint-token` (also sidecar-served),
+   which verifies the JWT a second time and then mints a fresh
+   PeerTube OAuth2 access token by calling PeerTube's own
+   `/api/v1/oauth-clients/local` and `/api/v1/users/token` over
+   loopback, using the persisted `admin-password.txt` as the
+   service-account credential.
+4. The page writes `access_token`, `refresh_token`, and `token_type`
+   to `localStorage` — the exact keys PeerTube's Angular SPA reads
+   (verified against
+   `/app/client/src/root-helpers/users/oauth-user-tokens.ts`
+   in the upstream tree).
+5. The page sets a marker cookie `openhost_pt_sso_until=<unix-ts>`
+   so subsequent visits skip the trampoline until the marker
+   expires (set to half the OAuth token's TTL — typically ~12h —
+   so re-mints happen well before the SPA would see a 401).
+6. Then redirects to the original URL.
+
+The end result: the owner clicks `https://peertube.<your-zone>` from
+the OpenHost dashboard and lands directly in the PeerTube admin UI,
+already logged in as `root`. No password prompt. The PeerTube mobile
+app and other third-party clients still work via the regular
+username + `admin-password.txt` flow — they don't see this trampoline.
+
+**Single user.** This package is designed for the typical "personal
+PeerTube instance" deployment shape (~20% of all real-world PeerTube
+instances are explicitly single-user). The owner's PeerTube identity
+is the bootstrap `root` admin. PeerTube's account/channel model is
+unchanged — `root` can create unlimited channels (e.g.
+`@gaming@peertube.zone`, `@cooking@peertube.zone`, etc.), each
+discoverable as a separate ActivityPub actor by remote instances,
+all owned by the same login.
+
+#### Threat model / sanity-check
+
+* The auth-proxy unconditionally strips `X-OpenHost-User` and
+  `X-OpenHost-Is-Owner` from inbound requests on every path.
+  Owner identity is determined exclusively by the JWT signature,
+  not by client-supplied headers.
+* The `/__openhost-sso/mint-token` endpoint is the only place the
+  PeerTube admin password leaves the sidecar process, and it
+  reaches only loopback. Without a valid owner JWT the endpoint
+  returns 401.
+* The trampoline page serves the same HTML to everyone (owner or
+  not); only the JSON token endpoint enforces JWT validity. This
+  means a non-owner who somehow lands on the trampoline gets a
+  graceful 401 + anonymous bounce-through, not an oracle.
+* The marker cookie is `Secure; SameSite=Lax; Path=/`. It carries
+  no privilege — it just opts the next visit out of the trampoline
+  redirect. A forged cookie with `openhost_pt_sso_until=99999999999`
+  causes the sidecar to skip the trampoline, but skipping means
+  "leave the request alone" — the request is then anonymous to
+  PeerTube unless the browser has the actual token in localStorage.
+
+### Why Caddy is still in the path
+
+Even with the auth-proxy added, Caddy still has the original
+Host-header rewriting job: PeerTube's `/api/v1/oauth-clients/local`
+handler hard-checks `req.headers.host == webserver.hostname[:port]`
+and returns 403 otherwise. The OpenHost router strips the original
+Host (httpx sets it to `127.0.0.1:9000`) and stuffs the public
+hostname into `X-Forwarded-Host`. Caddy reads `X-Forwarded-Host` and
+rewrites `Host` before forwarding. We could do this in Python in
+the auth-proxy directly, but Caddy's reverse-proxy layer is rock-solid
+and re-implementing it would be a regression risk.
 
 ## ⚠️ Federation hostname is permanent
 
@@ -110,27 +196,43 @@ upload.
 
 ## Logging in for the first time
 
-The `root` admin password is generated on first boot and written to
-`$OPENHOST_APP_DATA_DIR/admin-password.txt`. From inside the container:
+**Through the OpenHost zone (preferred path).** The auth-proxy
+sidecar (see "Auth model" above) auto-logs the zone owner in. Once
+the container is healthy, click the PeerTube tile in your OpenHost
+dashboard and you'll land directly in PeerTube's admin UI as the
+`root` user. No password prompt. The first navigation triggers a
+brief redirect through `/__openhost-sso/login` that mints an OAuth2
+token and writes it to `localStorage`; subsequent visits skip the
+trampoline until the token is close to expiry.
+
+**From outside the zone (PeerTube mobile app, third-party clients,
+break-glass).** Use the `root` username + the password in
+`admin-password.txt`. Read it from inside the container:
 
 ```
 cat /data/app_data/peertube/admin-password.txt
 ```
 
 (In the OpenHost dashboard's terminal-into-app feature, that path is
-exactly where the file lives.) On first boot, our start script logs the
-**path** to the password file — `[openhost-peertube] Initial root admin
-password is in /data/app_data/peertube/admin-password.txt`. PeerTube's
-upstream installer separately logs the **value** of the password to
-stdout once during the very first boot only (`info: User password:
-...`), so it appears in `/app_logs/peertube` until the log rolls over.
-Treat the in-host log as sensitive on first boot.
+exactly where the file lives.) On first boot, our start script logs
+the **path** to the password file — `[openhost-peertube] Initial root
+admin password is in /data/app_data/peertube/admin-password.txt`.
+PeerTube's upstream installer separately logs the **value** of the
+password to stdout once during the very first boot only
+(`info: User password: ...`), so it appears in `/app_logs/peertube`
+until the log rolls over. Treat the in-host log as sensitive on
+first boot.
 
 To reset the password later, exec into the container and run:
 
 ```
 cd /app && gosu peertube npm run reset-password -- -u root
 ```
+
+If you reset the password, the auth-proxy sidecar's cached
+credential is now stale: it'll keep returning HTTP 502 from the SSO
+trampoline until the container is restarted (the sidecar reads the
+password file once at startup).
 
 ## What's not configured
 

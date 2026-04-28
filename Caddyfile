@@ -1,5 +1,6 @@
-# Tiny Caddy front-door whose only job is to rewrite the Host
-# header before forwarding to PeerTube on the loopback port.
+# Tiny Caddy mid-tier whose only job is to rewrite the Host header
+# from X-Forwarded-Host before forwarding to PeerTube on the
+# loopback port.
 #
 # Background: PeerTube's /api/v1/oauth-clients/local handler
 # explicitly checks `req.headers.host == webserver.hostname[:port]`
@@ -16,8 +17,23 @@
 # X-Forwarded-Host correctly, so we just have to rewrite Host
 # from that header before the request hits PeerTube.
 #
-# Caddy listens on :9000 (the port openhost.toml advertises);
-# PeerTube actually runs on :9001 inside the container.
+# Topology:
+#
+#   OpenHost router  →  127.0.0.1:9000  (auth-proxy.py / SSO sidecar)
+#                   →  127.0.0.1:9090  (this Caddy)
+#                   →  127.0.0.1:9001  (PeerTube node)
+#
+# The auth-proxy fronts Caddy because it's the layer that
+# selectively triggers the SSO trampoline for owner navigations,
+# and because it strips X-OpenHost-* trust headers from inbound
+# requests.  Federation traffic, anonymous viewer traffic, and
+# already-authenticated owner traffic all pass through the
+# auth-proxy unchanged; only the trampoline path is intercepted.
+#
+# This Caddy stays in the path because the Host-rewriting job
+# is non-trivial to do safely from Python (we'd have to rebuild
+# the request line and reattach all the X-Forwarded-* headers
+# correctly), and Caddy is rock-solid at it.
 
 {
 	# No admin API, no automatic HTTPS — we are loopback-only.
@@ -34,10 +50,10 @@
 	}
 }
 
-# Listen on the port advertised in openhost.toml. The router
-# proxies to 127.0.0.1:<host_port> which Podman maps to
-# container_port 9000 -> this Caddy.
-:9000 {
+# Caddy listens on :9090.  The auth-proxy sidecar sits in front
+# of it on :9000 (the port advertised in openhost.toml).  When
+# the auth-proxy needs to reach Caddy it goes via 127.0.0.1:9090.
+:9090 {
 	# Rewrite the Host header from X-Forwarded-Host before
 	# proxying to PeerTube on its loopback port. If the header
 	# is absent (which would only happen if something other

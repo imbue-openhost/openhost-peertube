@@ -30,6 +30,15 @@
 # We use `wait -n` so a single failed child takes the whole
 # container down and OpenHost notices and restarts us. That
 # requires bash, not /bin/sh.
+#
+# Long-lived children supervised here:
+#   * postgres (started via pg_ctl, not a direct shell child;
+#     watched by a separate poller that signals us if it dies)
+#   * redis-server
+#   * the PeerTube node process
+#   * Caddy (Host-header rewriter, sits between auth-proxy and PeerTube)
+#   * auth-proxy.py (OpenHost zone_auth → PeerTube OAuth2 SSO bridge,
+#     the only listener on the public-facing port)
 
 set -euo pipefail
 
@@ -42,6 +51,22 @@ PG_DATA="$PERSIST/postgres"
 REDIS_DIR="$PERSIST/redis"
 PEERTUBE_DATA_DIR="$PERSIST/peertube-data"
 SECRETS_DIR="$PERSIST/secrets"
+
+# Internal port layout (every listener binds 127.0.0.1 only;
+# only the auth-proxy listens on 0.0.0.0:9000 because that's the
+# port openhost.toml advertises and the OpenHost router connects
+# to from outside the rootless network namespace).
+#
+#     auth-proxy   :9000   ── public, OpenHost-facing
+#       │
+#       ▼
+#     Caddy        :9090   ── loopback, rewrites Host header
+#       │
+#       ▼
+#     PeerTube     :9001   ── loopback, the actual node app
+AUTH_PROXY_LISTEN_PORT=9000
+CADDY_PORT=9090
+PEERTUBE_PORT=9001
 
 mkdir -p "$PERSIST" "$TEMP" \
          "$PEERTUBE_DATA_DIR" \
@@ -385,7 +410,8 @@ stop_postgres() {
 # they hit a failure. Variables not yet assigned are absorbed
 # by `${...:-}` so `set -u` doesn't trip.
 early_exit_teardown() {
-    for child in "${PEERTUBE_PID:-}" "${REDIS_PID:-}" "${CADDY_PID:-}"; do
+    for child in "${PEERTUBE_PID:-}" "${REDIS_PID:-}" \
+                 "${CADDY_PID:-}" "${AUTH_PROXY_PID:-}"; do
         if [[ -n "$child" ]]; then
             kill -TERM "$child" 2>/dev/null || true
         fi
@@ -607,12 +633,13 @@ fi
 log "PeerTube is listening; bringing up Caddy"
 
 # -----------------------------------------------------------------
-# Start Caddy (host-rewriter front-door)
+# Start Caddy (host-rewriter mid-tier)
 # -----------------------------------------------------------------
-# Caddy binds :9000 — the port advertised in openhost.toml — and
-# proxies every request to PeerTube on 127.0.0.1:9001 with the
-# Host header reconstituted from X-Forwarded-Host. This satisfies
-# PeerTube's hard-coded canonical-Host check on
+# Caddy binds :9090 (loopback only — the auth-proxy sidecar is
+# what actually listens on the OpenHost-router-facing port 9000)
+# and proxies every request to PeerTube on 127.0.0.1:9001 with
+# the Host header reconstituted from X-Forwarded-Host. This
+# satisfies PeerTube's hard-coded canonical-Host check on
 # /api/v1/oauth-clients/local without needing to dig that
 # behaviour out of upstream.
 #
@@ -620,7 +647,7 @@ log "PeerTube is listening; bringing up Caddy"
 # yet another running-as-root daemon. The bookworm package ships
 # a `caddy` system user we could use, but `nobody` is universal
 # and Caddy doesn't need persistent state for this config.
-log "Starting Caddy host-rewriter on :9000 -> :9001"
+log "Starting Caddy host-rewriter on :${CADDY_PORT} -> :${PEERTUBE_PORT}"
 # Caddy uses XDG_CONFIG_HOME / XDG_DATA_HOME to find a writable
 # directory for autosave state. Under `runuser -u nobody` the
 # default points at /nonexistent which (correctly) doesn't
@@ -638,12 +665,100 @@ XDG_CONFIG_HOME="$CADDY_HOME" XDG_DATA_HOME="$CADDY_HOME" \
 CADDY_PID=$!
 
 # Caddy startup is fast (~100ms) but give it a moment to bind
-# the port before the OpenHost router's first health check.
-# Bail loudly if it never came up — without Caddy the whole
-# stack is unreachable.
-sleep 1
-if ! kill -0 "$CADDY_PID" 2>/dev/null; then
-    log "FATAL: Caddy exited before supervisor started"
+# the port before we put the auth-proxy in front of it. Bail
+# loudly if Caddy never came up — without it the whole stack is
+# unreachable.  We poll the listening port (rather than just
+# checking ``kill -0``) because Caddy can briefly stay alive but
+# fail to bind, e.g. on a port-already-in-use error from a
+# previous incomplete teardown.
+CADDY_READY=0
+for _ in $(seq 1 30); do
+    if ! kill -0 "$CADDY_PID" 2>/dev/null; then
+        log "FATAL: Caddy exited during startup"
+        early_exit_teardown
+        exit 1
+    fi
+    if (echo > /dev/tcp/127.0.0.1/$CADDY_PORT) 2>/dev/null; then
+        CADDY_READY=1
+        break
+    fi
+    sleep 0.5
+done
+if [[ "$CADDY_READY" -ne 1 ]]; then
+    log "FATAL: Caddy didn't bind 127.0.0.1:$CADDY_PORT in 15s"
+    early_exit_teardown
+    exit 1
+fi
+
+# -----------------------------------------------------------------
+# Start auth-proxy sidecar (OpenHost zone_auth → PeerTube OAuth2 SSO)
+# -----------------------------------------------------------------
+# This is the layer the OpenHost router actually talks to.  It
+# sits in front of Caddy on the public-facing port (9000), passes
+# anonymous + federation traffic through unchanged, and for the
+# zone owner serves a one-time HTML trampoline on /__openhost-sso
+# that mints a PeerTube OAuth2 token from /api/v1/users/token and
+# writes it to localStorage so the SPA picks it up.  See
+# auth_proxy.py module docstring for the full design.
+#
+# Runs as `nobody` because it doesn't need any persistent state
+# of its own (the JWKS cache and OAuth client_id/secret cache are
+# in-memory; the admin password is read once at startup from
+# $ADMIN_PW_FILE).  It DOES need read access to the password
+# file, which is owned by root with mode 0600 — we briefly
+# expose it to nobody by making the parent secrets dir traversable
+# and setting the file mode to 0640 with group nobody.  This is
+# tighter than world-readable and gives the sidecar exactly what
+# it needs.
+#
+# Why not run as the same user as Caddy (which we also use as
+# `nobody`)?  Because we want to be able to swap user identity
+# in the future without coupling the two.  The cost of two
+# nobody processes is just two entries in /proc.
+log "Starting auth-proxy sidecar on :${AUTH_PROXY_LISTEN_PORT} -> Caddy :${CADDY_PORT}"
+
+# Make the admin-password file readable by the auth-proxy.  The
+# file is created by gen_secret() above with mode 0600 owned by
+# root.  We chgrp it to `nogroup` (the primary group of the
+# `nobody` user on Debian) and chmod 640 — root can still
+# write, the auth-proxy can read, the rest of the world cannot.
+chown root:nogroup "$ADMIN_PW_FILE"
+chmod 640 "$ADMIN_PW_FILE"
+# Ensure the secrets dir is traversable by `nobody` so it can
+# open the file by path.  Other files in the dir remain mode
+# 0600 owned by root (gen_secret default) so an `ls $SECRETS_DIR`
+# from `nobody` lists their names but reads fail.
+chmod 711 "$SECRETS_DIR"
+
+AUTH_PROXY_LOG_LEVEL="${AUTH_PROXY_LOG_LEVEL:-INFO}" \
+AUTH_PROXY_LISTEN_PORT="$AUTH_PROXY_LISTEN_PORT" \
+AUTH_PROXY_UPSTREAM_HOST="127.0.0.1" \
+AUTH_PROXY_UPSTREAM_PORT="$CADDY_PORT" \
+AUTH_PROXY_ADMIN_USER="root" \
+AUTH_PROXY_ADMIN_PW_FILE="$ADMIN_PW_FILE" \
+OPENHOST_ROUTER_URL="${OPENHOST_ROUTER_URL:-}" \
+    runuser -u nobody --preserve-environment -- \
+        python3 /opt/openhost-peertube/auth_proxy.py &
+AUTH_PROXY_PID=$!
+
+# Wait for the auth-proxy to bind :9000.  Same probe pattern as
+# Caddy.  If this never comes up the OpenHost router can't reach
+# us at all and the container is unreachable, so fail loudly.
+AP_READY=0
+for _ in $(seq 1 30); do
+    if ! kill -0 "$AUTH_PROXY_PID" 2>/dev/null; then
+        log "FATAL: auth-proxy exited during startup"
+        early_exit_teardown
+        exit 1
+    fi
+    if (echo > /dev/tcp/127.0.0.1/$AUTH_PROXY_LISTEN_PORT) 2>/dev/null; then
+        AP_READY=1
+        break
+    fi
+    sleep 0.5
+done
+if [[ "$AP_READY" -ne 1 ]]; then
+    log "FATAL: auth-proxy didn't bind 127.0.0.1:$AUTH_PROXY_LISTEN_PORT in 15s"
     early_exit_teardown
     exit 1
 fi
@@ -677,7 +792,8 @@ teardown() {
     if [[ -n "$PG_WATCHER_PID" ]]; then
         kill -TERM "$PG_WATCHER_PID" 2>/dev/null || true
     fi
-    kill -TERM "$PEERTUBE_PID" "$REDIS_PID" "$CADDY_PID" 2>/dev/null || true
+    kill -TERM "$PEERTUBE_PID" "$REDIS_PID" "$CADDY_PID" \
+        "$AUTH_PROXY_PID" 2>/dev/null || true
     stop_postgres
     wait || true
 }
@@ -701,15 +817,19 @@ trap teardown TERM INT
 PG_WATCHER_PID=$!
 
 set +e
-wait -n "$PEERTUBE_PID" "$REDIS_PID" "$CADDY_PID"
+wait -n "$PEERTUBE_PID" "$REDIS_PID" "$CADDY_PID" "$AUTH_PROXY_PID"
 EXIT_CODE=$?
 set -e
 
 # Identify which child died for diagnostics. By the time we get
-# here at least one of the three pids is gone; the others may
+# here at least one of the four pids is gone; the others may
 # still be alive (the supervisor will TERM them in teardown).
 DEAD=""
-for tag_pid in "peertube=$PEERTUBE_PID" "redis=$REDIS_PID" "caddy=$CADDY_PID"; do
+for tag_pid in \
+        "peertube=$PEERTUBE_PID" \
+        "redis=$REDIS_PID" \
+        "caddy=$CADDY_PID" \
+        "auth-proxy=$AUTH_PROXY_PID"; do
     tag="${tag_pid%%=*}"
     pid="${tag_pid##*=}"
     if ! kill -0 "$pid" 2>/dev/null; then
