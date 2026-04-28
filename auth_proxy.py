@@ -22,11 +22,13 @@ PeerTube's localStorage-based OAuth2 client:
          service-account credential just on the loopback);
        * writes ``access_token``, ``refresh_token``, ``token_type``
          to localStorage — the exact keys the PeerTube SPA reads
-         (see /app/client/src/root-helpers/users/oauth-user-tokens.ts);
-       * sets a marker cookie ``openhost_pt_sso_until=<unix-ts>``
-         scoped to ``/`` so subsequent visits skip the trampoline
-         until the marker expires;
-       * redirects to the original URL.
+         (see /app/client/src/root-helpers/users/oauth-user-tokens.ts).
+   The mint-token response from the sidecar additionally carries
+   a ``Set-Cookie: openhost_pt_sso_until=<unix-ts>; Path=/; ...``
+   header so subsequent visits skip the trampoline until the
+   marker expires.  (The cookie is set server-side; the trampoline
+   JS itself only touches localStorage.)  Once both write paths
+   complete, the JS redirects to the original URL.
    On subsequent visits, the marker cookie is present and unexpired,
    so the sidecar passes the request through untouched and the SPA
    reads the still-valid token from localStorage on its own.
@@ -483,8 +485,12 @@ class PeerTubeOauthBridge:
     so the simplicity is worth it.
 
     Client_id / client_secret are cached because they don't change
-    until PeerTube restarts.  We refresh them on any token-mint
-    failure to recover from a PeerTube restart between mints.
+    until PeerTube restarts.  Specifically: on a token-endpoint
+    HTTP 400 (which PeerTube returns when the cached creds are
+    stale because PeerTube restarted between mints), we
+    force-refresh the creds and retry the mint exactly once.
+    Other failures (network errors, 5xx, 400 on the second
+    attempt) raise immediately — no further retry.
     """
 
     def __init__(
@@ -521,24 +527,49 @@ class PeerTubeOauthBridge:
         return {"Host": self._canonical_host}
 
     def _fetch_client_creds(self, force: bool = False) -> tuple[str, str]:
+        # Fast path: cache hit.  Take the lock just for the
+        # snapshot read so concurrent readers don't tear the
+        # tuple.  Mirrors the JwksCache.get pattern.
         with self._client_lock:
-            if not force and self._client_id and self._client_secret:
-                return self._client_id, self._client_secret
-            url = self._peertube_url("/api/v1/oauth-clients/local")
+            cached = (self._client_id, self._client_secret)
+        if not force and cached[0] and cached[1]:
+            return cached  # type: ignore[return-value]
+
+        # Slow path: fetch from PeerTube.  Don't hold the cache
+        # lock across the network I/O — that would serialize
+        # every concurrent owner mint behind a 10-second worst-
+        # case timeout.  Multiple concurrent fetches are wasteful
+        # but not unsafe: PeerTube's client creds rotate only on
+        # PeerTube restart, so any racing fetches will all return
+        # the same value.
+        url = self._peertube_url("/api/v1/oauth-clients/local")
+        try:
             with requests.get(
                 url, headers=self._request_headers(), timeout=10
             ) as resp:
                 resp.raise_for_status()
                 data = resp.json()
-            cid = data.get("client_id")
-            csec = data.get("client_secret")
-            if not cid or not csec:
-                raise RuntimeError(
-                    "PeerTube /oauth-clients/local returned no client_id"
-                )
+        except (json.JSONDecodeError, ValueError) as exc:
+            # Distinct error for the JSON-parse failure case so the
+            # log surfaces it as a parse error rather than a
+            # generic exception (a foreseeable failure when the
+            # upstream responds with HTML — e.g. a
+            # misconfiguration that exposes Caddy's default error
+            # page in place of PeerTube).
+            raise RuntimeError(
+                "PeerTube /oauth-clients/local returned non-JSON response"
+            ) from exc
+        cid = data.get("client_id") if isinstance(data, dict) else None
+        csec = data.get("client_secret") if isinstance(data, dict) else None
+        if not cid or not csec:
+            raise RuntimeError(
+                "PeerTube /oauth-clients/local returned no client_id"
+            )
+        # Publish the new creds atomically.
+        with self._client_lock:
             self._client_id = cid
             self._client_secret = csec
-            return cid, csec
+        return cid, csec
 
     def mint_token(self) -> dict:
         """Mint a new OAuth2 access token for the configured user.
@@ -981,32 +1012,54 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
             self._sso_json_response(401, {"error": "not_owner"})
             return
 
+        # ``failure_until`` is the short-lived marker timestamp we
+        # apply on every error path so the browser doesn't loop the
+        # trampoline through a brief PeerTube outage.  Recomputed
+        # at use time in case mint_token blocks for a while.
+        def _failure_marker() -> int:
+            return int(time.time() + SSO_FAILURE_MARKER_SEC)
+
         try:
             tokens = self.oauth_bridge.mint_token()
         except Exception as exc:  # noqa: BLE001
             log.warning("PeerTube token mint failed: %s", exc)
-            # Set a SHORT-lived failure marker so the browser
-            # doesn't ping-pong through the trampoline if PeerTube
-            # is briefly unavailable.  The marker's value is just a
-            # timestamp; the sidecar uses ``_marker_cookie_valid``
-            # which only cares that the value is in the future, so
-            # we don't need a separate "this is a failure marker"
-            # type.  After SSO_FAILURE_MARKER_SEC the trampoline
-            # will retry naturally.
-            failure_until = int(time.time() + SSO_FAILURE_MARKER_SEC)
             self._sso_json_response(
                 502,
                 {"error": "mint_failed"},
-                marker_until=failure_until,
+                marker_until=_failure_marker(),
+            )
+            return
+
+        # PeerTube always returns a JSON object on 200, but a buggy
+        # or compromised upstream COULD return a list / null /
+        # string.  Guard so the token-shape check below doesn't
+        # raise TypeError.
+        if not isinstance(tokens, dict):
+            log.warning(
+                "PeerTube token response is not a JSON object (got %s)",
+                type(tokens).__name__,
+            )
+            self._sso_json_response(
+                502,
+                {"error": "mint_malformed"},
+                marker_until=_failure_marker(),
             )
             return
 
         # Minimal sanity-check.  PeerTube always returns these keys
-        # on success; if they're missing something is severely wrong.
+        # on success; if they're missing something is severely
+        # wrong.  Set the failure marker on this path too so the
+        # browser doesn't loop through the trampoline (the
+        # malformed-response case is one PeerTube doesn't recover
+        # from on its own — operator intervention needed).
         for k in ("access_token", "refresh_token", "token_type"):
             if k not in tokens:
                 log.warning("PeerTube token response missing %s", k)
-                self._sso_json_response(502, {"error": "mint_malformed"})
+                self._sso_json_response(
+                    502,
+                    {"error": "mint_malformed"},
+                    marker_until=_failure_marker(),
+                )
                 return
 
         # Compute the marker-cookie expiry.  The marker MUST expire
@@ -1016,7 +1069,27 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
         # stale.  We bake in SSO_MARKER_SAFETY_MARGIN_SEC of
         # headroom: marker_until = now + expires_in - margin.  For
         # the typical 24h PeerTube token, the marker lasts 23h.
-        expires_in = int(tokens.get("expires_in") or 86400)
+        #
+        # Use an explicit ``is None`` check so a legitimate
+        # ``expires_in: 0`` (which would be a degenerate but valid
+        # PeerTube response) is detected and handled — the
+        # falsy-or idiom would silently substitute the 86400
+        # default for any zero/empty value, masking the issue.
+        raw_expires = tokens.get("expires_in")
+        try:
+            expires_in = int(raw_expires) if raw_expires is not None else 86400
+        except (TypeError, ValueError):
+            log.warning(
+                "PeerTube returned non-numeric expires_in=%r; using default 24h",
+                raw_expires,
+            )
+            expires_in = 86400
+        if expires_in <= 0:
+            log.warning(
+                "PeerTube returned non-positive expires_in=%d; "
+                "marker cookie will use a 60s floor",
+                expires_in,
+            )
         marker_lifetime = max(60, expires_in - SSO_MARKER_SAFETY_MARGIN_SEC)
         marker_until = int(time.time() + marker_lifetime)
 
@@ -1052,7 +1125,19 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
         do here is wipe the marker so the sidecar will re-trigger
         the trampoline on the next owner visit, which in turn will
         replace the stale localStorage tokens.
+
+        We require POST to invalidate the marker.  A bare GET
+        navigation under ``SameSite=Lax`` would carry the
+        ``zone_auth`` cookie (Lax permits top-level GETs from
+        cross-origin), so a malicious cross-site link
+        ``<a href="https://peertube.zone/__openhost-sso/logout">``
+        could clear the marker without the user's consent and force
+        a re-trampoline on their next visit.  Annoying but not a
+        privilege escalation — still cleaner to require POST.
         """
+        if self.command not in ("POST",):
+            self._safe_send_error(405, "Method Not Allowed")
+            return
         # ``_build_marker_cookie`` already gates ``Secure`` on
         # ``X-Forwarded-Proto`` so the unset Set-Cookie addresses
         # the same cookie scope as the original.  A mismatched
@@ -1332,15 +1417,23 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
         """Read bytes from ``sock`` until ``\\r\\n\\r\\n``.
 
         Returns ``(head_including_terminator, leftover_bytes)`` or
-        ``None`` on EOF / overflow.  ``leftover_bytes`` is whatever
-        bytes were read past the header terminator in the same
-        recv() — typically empty for a WebSocket handshake but a
-        misbehaving upstream COULD pipe data immediately after the
-        headers.
+        ``None`` on EOF / overflow / socket error.  ``leftover_bytes``
+        is whatever bytes were read past the header terminator in
+        the same recv() — typically empty for a WebSocket handshake
+        but a misbehaving upstream COULD pipe data immediately after
+        the headers.
+
+        OSError (incl. socket.timeout) is caught and treated as a
+        failure, since the call site can't drive a different
+        response when this returns.
         """
         buf = bytearray()
         while True:
-            chunk = sock.recv(4096)
+            try:
+                chunk = sock.recv(4096)
+            except OSError as exc:
+                log.info("websocket handshake recv failed: %s", exc)
+                return None
             if not chunk:
                 return None
             buf.extend(chunk)
@@ -1865,6 +1958,12 @@ def _read_admin_password(path: str) -> str:
     Without this credential we have no way to mint OAuth tokens for
     the owner — that's a hard fail rather than a runtime degraded
     state.
+
+    Decoding uses ``errors="strict"`` so a non-UTF-8 byte in the
+    file (corrupted save / wrong file pointed at) fails immediately
+    with a clear UnicodeDecodeError instead of silently substituting
+    U+FFFD into the password and producing every PeerTube auth as
+    a 401 with no obvious cause.
     """
     try:
         with open(path, "rb") as f:
@@ -1873,7 +1972,12 @@ def _read_admin_password(path: str) -> str:
         raise RuntimeError(
             f"cannot read admin password from {path}: {exc}"
         ) from exc
-    pw = first_line.decode("utf-8", errors="replace").strip()
+    try:
+        pw = first_line.decode("utf-8", errors="strict").strip()
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(
+            f"admin password file {path} is not valid UTF-8: {exc}"
+        ) from exc
     if not pw:
         raise RuntimeError(
             f"admin password file {path} is empty/whitespace-only"

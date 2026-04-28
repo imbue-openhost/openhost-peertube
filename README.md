@@ -65,14 +65,17 @@ the PeerTube web UI, the auth-proxy:
    (verified against
    `/app/client/src/root-helpers/users/oauth-user-tokens.ts`
    in the upstream tree).
-5. The page sets a marker cookie `openhost_pt_sso_until=<unix-ts>`
-   so subsequent visits skip the trampoline until the marker
-   expires. The marker is set to expire 1 hour before the OAuth
-   token does (so for the typical 24-hour PeerTube token the
-   marker lasts ~23 hours), giving the next trampoline a fresh
-   opportunity to re-mint while the current token still has time
-   left — the SPA never sees a 401 from a stale token.
-6. Then redirects to the original URL.
+5. The sidecar's mint-token response sets a marker cookie
+   `openhost_pt_sso_until=<unix-ts>` via `Set-Cookie` (the
+   browser-side trampoline JS does not touch the cookie itself —
+   only `localStorage`). Subsequent visits skip the trampoline
+   until the marker expires. The marker is set to expire 1 hour
+   before the OAuth token does (so for the typical 24-hour
+   PeerTube token the marker lasts ~23 hours), giving the next
+   trampoline a fresh opportunity to re-mint while the current
+   token still has time left — the SPA never sees a 401 from a
+   stale token.
+6. Then the JS redirects to the original URL.
 
 The end result: the owner clicks `https://peertube.<your-zone>` from
 the OpenHost dashboard and lands directly in the PeerTube admin UI,
