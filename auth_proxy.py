@@ -472,9 +472,9 @@ class PeerTubeOauthBridge:
     EXACTLY: any other value (including ``127.0.0.1:9090`` which
     Caddy would forward without an X-Forwarded-Host to rewrite from)
     returns 403.  The bridge has the canonical hostname available
-    (it's in the env via $PEERTUBE_WEBSERVER_HOSTNAME, surfaced as
-    ``canonical_host`` in our constructor), so we just send it
-    directly.
+    via the ``canonical_host`` constructor argument (start.sh
+    derives it from ``PT_HTTPS`` + ``PT_PORT`` and passes the value
+    as ``$AUTH_PROXY_CANONICAL_HOST``), so we just send it directly.
 
     We DO NOT cache the access token globally; we mint a fresh one
     each time the trampoline fires for an owner visit, and let the
@@ -601,7 +601,14 @@ class PeerTubeOauthBridge:
             raise RuntimeError(
                 f"PeerTube token mint failed: HTTP {failed_status}"
             )
-        raise RuntimeError("PeerTube token mint failed: out of attempts")
+        # Unreachable: every iteration of the for loop above either
+        # returns on success, raises on terminal failure, or
+        # ``continue``s after the first 400.  Defensive raise so a
+        # future refactor that adds an unguarded path doesn't fall
+        # off the end of the function and return None to the
+        # caller (which would attempt to ``tokens["access_token"]``
+        # and crash with a less obvious traceback).
+        raise RuntimeError("PeerTube token mint loop exhausted unexpectedly")
 
 
 # ---------------------------------------------------------------------------
@@ -815,12 +822,27 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
             log.debug("trampoline ?next= parse failed: %s", exc)
             raw_next = "/"
         next_path = _safe_next_path(raw_next)
-        # Basic XSS hardening — echo back into JS string literal and
-        # HTML attribute.  ``json.dumps`` produces a safe JS string
-        # literal even for adversarial inputs (it escapes ``</`` →
-        # ``<\/`` etc.).  ``html.escape`` covers the textual
-        # fallback link.
-        next_path_js = json.dumps(next_path)
+        # XSS hardening — echo back into a JS string literal AND an
+        # HTML attribute.
+        #
+        # ``json.dumps`` alone is NOT sufficient for embedding into
+        # an inline ``<script>`` block: it does not escape ``<`` or
+        # ``/``, so an input like ``</script><script>alert(1)`` would
+        # close our script tag and execute attacker JS.  The standard
+        # mitigation is to additionally escape ``<`` to its JS-string
+        # unicode form ``\u003c`` (and ``>`` to ``\u003e`` for good
+        # measure, in case a future browser parser uses it as a
+        # script-tag delimiter).  ``\u`` escapes are inert inside JS
+        # string literals — they decode at parse time but do not
+        # break out of the surrounding quote.
+        next_path_js = (
+            json.dumps(next_path)
+            .replace("<", "\\u003c")
+            .replace(">", "\\u003e")
+        )
+        # ``html.escape(..., quote=True)`` escapes ``"`` and ``'``
+        # within the value, which is what we need given the
+        # surrounding ``href="..."`` quotes.
         next_path_attr = html.escape(next_path, quote=True)
 
         body = f"""<!doctype html>
@@ -929,17 +951,19 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
         owner zone_auth.  Returns 5xx if PeerTube is unreachable or
         rejects our credentials.
 
-        Authorisation here is exclusively the zone_auth JWT.  No
-        path-based gating is needed because the trampoline path
-        ``/__openhost-sso/mint-token`` itself is dispatched in
-        ``_dispatch`` BEFORE any federation/anonymous bypass logic —
-        every reach to this method has already had its zone_auth
-        cookie inspected by the dispatcher.  We re-verify the JWT
-        here as defence in depth (so a future refactor of
-        ``_dispatch`` can't accidentally expose this endpoint).
+        Authorisation here is the zone_auth JWT verified inside
+        this method via ``_verify_owner``.  ``_dispatch`` routes
+        the path here directly (it dispatches by URL prefix BEFORE
+        the cookie inspection logic that drives the owner
+        trampoline redirect), so this method's own JWT check is
+        the SOLE enforcement — not a defence in depth.  Any change
+        that loosens it must be paired with a stronger check at
+        the dispatch layer.
         """
-        # Strip request body — POST etc. has no business here, this
-        # is GET-only.
+        # GET (page-load) and HEAD (occasional probe) are the only
+        # methods that make sense on this endpoint.  Anything else
+        # is a misuse and gets a clean 405 instead of being passed
+        # through.
         if self.command not in ("GET", "HEAD"):
             self._safe_send_error(405, "Method Not Allowed")
             return
@@ -1372,23 +1396,41 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                 for key, _ in events:
                     if key.data == "client":
                         src, dst = client_sock, upstream_sock
+                        direction = "client→upstream"
                     else:
                         src, dst = upstream_sock, client_sock
+                        direction = "upstream→client"
                     try:
                         chunk = src.recv(STREAM_CHUNK_BYTES)
-                    except OSError:
+                    except OSError as exc:
+                        # Match _stream_inner's IO-error log level
+                        # (INFO) so a network drop mid-WebSocket is
+                        # visible at the default log level.
+                        log.info(
+                            "websocket %s recv failed: %s",
+                            direction, exc,
+                        )
                         return
                     if not chunk:
+                        # Clean half-close from the source.  Common
+                        # at the end of a normal WebSocket session
+                        # (Close frame sent then peer closes its
+                        # send-side); log at DEBUG.
+                        log.debug("websocket %s EOF; closing", direction)
                         return
                     try:
                         dst.sendall(chunk)
-                    except OSError:
+                    except OSError as exc:
+                        log.info(
+                            "websocket %s sendall failed: %s",
+                            direction, exc,
+                        )
                         return
         finally:
             try:
                 sel.close()
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                log.debug("websocket selector close failed: %s", exc)
 
     @staticmethod
     def _encode_header_bytes(value: str) -> bytes:

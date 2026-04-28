@@ -805,11 +805,11 @@ fi
 # -----------------------------------------------------------------
 # Supervisor
 # -----------------------------------------------------------------
-# Forward SIGTERM/SIGINT to all three children + the postgres
-# postmaster. We don't track postmaster's PID directly (pg_ctl
-# starts it as a daemonized child of postgres) so we send the
-# signal via pg_ctl stop on shutdown. Redis and PeerTube have
-# their PIDs.
+# Forward SIGTERM/SIGINT to all four direct children (PeerTube,
+# Redis, Caddy, auth-proxy) plus the postgres postmaster. We
+# don't track postmaster's PID directly (pg_ctl starts it as a
+# daemonized child of postgres) so we send the signal via
+# pg_ctl stop on shutdown. The four others have their PIDs.
 #
 # Renamed from the more obvious `shutdown` to avoid shadowing
 # /usr/sbin/shutdown — a future maintainer who wants to

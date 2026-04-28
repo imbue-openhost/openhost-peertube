@@ -8,7 +8,11 @@ as a single-container OpenHost app.
 * PostgreSQL 15
 * Redis 7 (whatever bookworm-main ships)
 * PeerTube (`chocobozzz/peertube:production-bookworm`, currently v7.x)
-* Caddy 2 (one-job front-door — see below)
+* Caddy 2 (Host-header rewriter mid-tier — see "Auth model" below)
+* A small Python auth-proxy sidecar that fronts everything else
+  on the OpenHost-router-facing port and bridges the zone owner's
+  `zone_auth` cookie to a freshly-minted PeerTube OAuth2 token —
+  see "Auth model" below
 * ffmpeg, invoked on-demand by the PeerTube node process for transcoding
   (it is not a long-lived service)
 
@@ -63,8 +67,11 @@ the PeerTube web UI, the auth-proxy:
    in the upstream tree).
 5. The page sets a marker cookie `openhost_pt_sso_until=<unix-ts>`
    so subsequent visits skip the trampoline until the marker
-   expires (set to half the OAuth token's TTL — typically ~12h —
-   so re-mints happen well before the SPA would see a 401).
+   expires. The marker is set to expire 1 hour before the OAuth
+   token does (so for the typical 24-hour PeerTube token the
+   marker lasts ~23 hours), giving the next trampoline a fresh
+   opportunity to re-mint while the current token still has time
+   left — the SPA never sees a 401 from a stale token.
 6. Then redirects to the original URL.
 
 The end result: the owner clicks `https://peertube.<your-zone>` from
