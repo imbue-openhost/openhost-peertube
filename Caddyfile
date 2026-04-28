@@ -26,11 +26,13 @@
 #                   →  127.0.0.1:9001  (PeerTube node)
 #
 # The auth-proxy fronts Caddy because it's the layer that
-# selectively triggers the SSO trampoline for owner navigations,
-# and because it strips X-OpenHost-* trust headers from inbound
+# selectively bounces zone owners to the in-PeerTube SSO plugin
+# (peertube-plugin-auth-openhost-sso, installed by start.sh on
+# first boot) and strips X-OpenHost-* trust headers from inbound
 # requests.  Federation traffic, anonymous viewer traffic, and
 # already-authenticated owner traffic all pass through the
-# auth-proxy unchanged; only the trampoline path is intercepted.
+# auth-proxy unchanged; only the first-time owner navigation
+# is bounced to /plugins/auth-openhost-sso/router/auto-login.
 #
 # This Caddy stays in the path because the Host-rewriting job
 # is non-trivial to do safely from Python (we'd have to rebuild

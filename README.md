@@ -9,10 +9,11 @@ as a single-container OpenHost app.
 * Redis 7 (whatever bookworm-main ships)
 * PeerTube (`chocobozzz/peertube:production-bookworm`, currently v7.x)
 * Caddy 2 (Host-header rewriter mid-tier — see "Auth model" below)
-* A small Python auth-proxy sidecar that fronts everything else
-  on the OpenHost-router-facing port and bridges the zone owner's
-  `zone_auth` cookie to a freshly-minted PeerTube OAuth2 token —
-  see "Auth model" below
+* A small Python auth-proxy sidecar that fronts everything else on
+  the OpenHost-router-facing port — see "Auth model" below
+* `peertube-plugin-auth-openhost-sso` — a bundled PeerTube plugin
+  that registers an external auth method, installed onto the
+  running PeerTube on first boot via the standard plugin admin API.
 * ffmpeg, invoked on-demand by the PeerTube node process for transcoding
   (it is not a long-lived service)
 
@@ -22,7 +23,7 @@ the auth-proxy sidecar — are supervised by a small bash parent
 container down if any one exits. OpenHost notices the exit and
 restarts us.
 
-### Auth model: anonymous watch + owner SSO via trampoline
+### Auth model: anonymous watch + owner SSO via PeerTube's external-auth API
 
 The container's listening surface looks like this:
 
@@ -31,12 +32,12 @@ The container's listening surface looks like this:
        │
        ▼
    :9000   auth-proxy sidecar (auth_proxy.py)
-       │   ── trampoline-based owner SSO; pass-through for everyone else
+       │   ── owner-bounce; pass-through for everyone else
        ▼
    :9090   Caddy (Host-header rewriter)
        │   ── rewrites Host: to X-Forwarded-Host before forwarding
        ▼
-   :9001   PeerTube node (the actual app)
+   :9001   PeerTube node (the actual app, with the SSO plugin loaded)
 ```
 
 **Anonymous viewers and federation traffic** pass straight through
@@ -47,52 +48,51 @@ federation paths would break inbound follows, video discovery,
 comment delivery, and HLS streaming to remote viewers.
 
 **The zone owner** (anyone holding a router-issued `zone_auth` JWT
-cookie) gets a different experience. When the owner navigates to
-the PeerTube web UI, the auth-proxy:
+cookie, `sub == "owner"`) is auto-logged-in via PeerTube's own
+external-auth API. Mirroring the openhost-miniflux pattern (where
+miniflux's `AUTH_PROXY_HEADER` does the equivalent) and the
+openhost-plane.so pattern (where `forward_auth` to `/check-session`
+manufactures a Django session): instead of a hand-rolled
+localStorage trampoline, the actual sign-in is delegated to
+PeerTube's own login flow.
 
-1. Verifies the `zone_auth` cookie against the OpenHost router's
-   JWKS (RS256, `sub == "owner"`).
-2. Redirects the owner to `/__openhost-sso/login`, a tiny static
-   HTML page served by the sidecar itself.
-3. That page calls `/__openhost-sso/mint-token` (also sidecar-served),
-   which verifies the JWT a second time, mints a fresh PeerTube
-   OAuth2 access token by calling PeerTube's own
-   `/api/v1/oauth-clients/local` and `/api/v1/users/token` over
-   loopback (using the persisted `admin-password.txt` as the
-   service-account credential), then calls `/api/v1/users/me` with
-   the minted token to fetch the four identity fields the SPA
-   needs (`id`, `username`, `email`, `role.id`).
-4. The page writes seven items to `localStorage`:
-   - the OAuth token triple (`access_token`, `refresh_token`,
-     `token_type`),
-   - and the four user-identity fields (`id`, `username`, `email`,
-     `role`).
-   These are the exact keys PeerTube's Angular SPA reads on
-   bootstrap. The token triple is verified against
-   `/app/client/src/root-helpers/users/oauth-user-tokens.ts` in
-   the upstream tree; the user-identity quartet is what
-   `getLoggedInUser` in the SPA's user-local-storage service
-   reads — without it the SPA's bootstrap (`loadUser` in
-   `main.js`) treats the visitor as anonymous EVEN with valid
-   tokens. `id` and `role` are stored as stringified integers,
-   matching what the SPA's standard login flow writes.
-5. The sidecar's mint-token response sets a marker cookie
-   `openhost_pt_sso_until=<unix-ts>` via `Set-Cookie` (the
-   browser-side trampoline JS does not touch the cookie itself —
-   only `localStorage`). Subsequent visits skip the trampoline
-   until the marker expires. The marker is set to expire 1 hour
-   before the OAuth token does (so for the typical 24-hour
-   PeerTube token the marker lasts ~23 hours), giving the next
-   trampoline a fresh opportunity to re-mint while the current
-   token still has time left — the SPA never sees a 401 from a
-   stale token.
-6. Then the JS redirects to the original URL.
+The flow:
 
-The end result: the owner clicks `https://peertube.<your-zone>` from
-the OpenHost dashboard and lands directly in the PeerTube admin UI,
-already logged in as `root`. No password prompt. The PeerTube mobile
-app and other third-party clients still work via the regular
-username + `admin-password.txt` flow — they don't see this trampoline.
+1. Owner browser navigates to `https://peertube.<your-zone>/` (or
+   any other HTML page on the instance).
+2. The auth-proxy sidecar verifies the `zone_auth` cookie against
+   the OpenHost router's JWKS (RS256, `sub == "owner"`). On a hit
+   AND no `openhost_pt_sso_marker` cookie present, the sidecar
+   responds with a 302 to
+   `/plugins/auth-openhost-sso/router/auto-login` and a short-TTL
+   marker cookie that prevents the bounce from re-firing during
+   the redirect chain.
+3. That `/auto-login` route is exposed by
+   `peertube-plugin-auth-openhost-sso` (the bundled plugin
+   installed on first boot). The plugin re-verifies the same
+   `zone_auth` cookie against the same JWKS and calls
+   PeerTube's `userAuthenticated()` external-auth helper with
+   `username=root, role=Administrator`.
+4. PeerTube generates a one-time `externalAuthToken`, stores
+   `(token → user)` in an in-memory map for ~5 minutes, and
+   redirects the browser to `/login?externalAuthToken=…&username=root`.
+5. The PeerTube SPA's standard login page reads those query
+   params and POSTs to `/api/v1/users/token` with
+   `grant_type=password`, `externalAuthToken=…`. PeerTube swaps
+   the bypass token for a normal OAuth access/refresh pair.
+6. The SPA's native login flow primes its localStorage with the
+   token triple and the four user-identity fields exactly the
+   way a regular password login does — no plugin/sidecar gymnastics
+   required to track the SPA's internal contract. The SPA then
+   navigates to the homepage with the owner logged in as `root`
+   admin.
+
+The end result: the owner clicks `https://peertube.<your-zone>`
+from the OpenHost dashboard and lands directly in the PeerTube
+admin UI, already logged in as `root`. No password prompt. The
+PeerTube mobile app and other third-party clients still work via
+the regular username + `admin-password.txt` flow — they get a
+plain password login form because they don't carry `zone_auth`.
 
 **Single user.** This package is designed for the typical "personal
 PeerTube instance" deployment shape (~20% of all real-world PeerTube
@@ -103,33 +103,49 @@ unchanged — `root` can create unlimited channels (e.g.
 discoverable as a separate ActivityPub actor by remote instances,
 all owned by the same login.
 
+**Why a plugin instead of localStorage trampoline?** An earlier
+revision used a sidecar-served HTML trampoline that minted a
+PeerTube OAuth token and primed `localStorage` directly. That
+approach worked at the API level but failed to fully bootstrap
+the Angular SPA — the SPA's auth state machine reads more
+localStorage keys than the trampoline populated (id, username,
+email, role on top of the access/refresh/type triple), and
+matching the SPA's internal contract against a moving upstream
+is brittle. Routing through the plugin's `registerExternalAuth`
+flow puts ALL the identity-bootstrap responsibility back inside
+PeerTube — which both fixes the bug and removes ~700 lines of
+trampoline-state machinery from the sidecar.
+
 #### Threat model / sanity-check
 
 * The auth-proxy unconditionally strips `X-OpenHost-User` and
   `X-OpenHost-Is-Owner` from inbound requests on every PROXIED
-  path (i.e. everything except the three sidecar-served
-  `/__openhost-sso/*` endpoints, which never use those headers
-  for any decision anyway). Owner identity is determined
-  exclusively by the JWT signature, not by client-supplied
+  path. Owner identity is determined exclusively by the JWT
+  signature on the `zone_auth` cookie, not by client-supplied
   headers.
-* The `/__openhost-sso/mint-token` endpoint is the only place the
-  PeerTube admin password leaves the sidecar process, and it
-  reaches only loopback. Without a valid owner JWT the endpoint
-  returns 401.
-* The trampoline page serves the same HTML to everyone (owner or
-  not); only the JSON token endpoint enforces JWT validity. This
-  means a non-owner who somehow lands on the trampoline gets a
-  graceful 401 + anonymous bounce-through, not an oracle.
+* The plugin re-verifies the JWT itself rather than trusting the
+  fact that the auth-proxy bounced the request. Belt-and-suspenders:
+  if anyone bypasses the auth-proxy and directly hits
+  `/plugins/auth-openhost-sso/router/auto-login`, they still need
+  a valid owner `zone_auth` cookie to get logged in.
 * The marker cookie is `SameSite=Lax; Path=/`, plus `Secure` when
   the connection arrived over HTTPS (always true on the OpenHost
   router; the sidecar omits `Secure` in dev / `lvh.me` setups so
   browsers don't silently drop a Secure cookie over plain HTTP
-  and re-trigger the trampoline). It carries no privilege — it
-  just opts the next visit out of the trampoline redirect. A
-  forged cookie with `openhost_pt_sso_until=99999999999` causes
-  the sidecar to skip the trampoline, but skipping means "leave
-  the request alone" — the request is then anonymous to PeerTube
-  unless the browser has the actual token in localStorage.
+  and re-trigger the bounce). It carries no privilege — it just
+  opts the next visit out of the bounce redirect. A forged
+  cookie with the marker pre-set causes the sidecar to skip the
+  bounce, but skipping means "leave the request alone" — the
+  request is then anonymous to PeerTube unless the browser has
+  valid OAuth tokens of its own.
+* PeerTube's `externalAuthToken` is a 32-byte random nonce with
+  a 5-minute TTL stored in an in-memory map; it can only be
+  redeemed once, and the redemption is tied to the username.
+  An attacker who somehow steals one would have a 5-minute
+  window to log in as `root` once. The token is delivered via
+  a `?externalAuthToken=` query parameter (not a header) so
+  it appears in browser history and any logging tier that
+  records URLs — which is why we keep the TTL tight.
 
 ### Why Caddy is still in the path
 
@@ -225,13 +241,15 @@ upload.
 ## Logging in for the first time
 
 **Through the OpenHost zone (preferred path).** The auth-proxy
-sidecar (see "Auth model" above) auto-logs the zone owner in. Once
-the container is healthy, click the PeerTube tile in your OpenHost
-dashboard and you'll land directly in PeerTube's admin UI as the
-`root` user. No password prompt. The first navigation triggers a
-brief redirect through `/__openhost-sso/login` that mints an OAuth2
-token and writes it to `localStorage`; subsequent visits skip the
-trampoline until the token is close to expiry.
+sidecar (see "Auth model" above) bounces the zone owner through
+PeerTube's external-auth flow. Once the container is healthy, click
+the PeerTube tile in your OpenHost dashboard and you'll land
+directly in PeerTube's admin UI as the `root` user. No password
+prompt. The first navigation triggers a brief redirect through
+`/plugins/auth-openhost-sso/router/auto-login` →
+`/login?externalAuthToken=…` and the SPA's native login flow does
+the rest; subsequent visits within ~5 minutes skip the bounce
+entirely (the marker cookie suppresses it).
 
 **From outside the zone (PeerTube mobile app, third-party clients,
 break-glass).** Use the `root` username + the password in
@@ -257,10 +275,14 @@ To reset the password later, exec into the container and run:
 cd /app && gosu peertube npm run reset-password -- -u root
 ```
 
-If you reset the password, the auth-proxy sidecar's cached
-credential is now stale: it'll keep returning HTTP 502 from the SSO
-trampoline until the container is restarted (the sidecar reads the
-password file once at startup).
+After a password reset, the in-PeerTube SSO plugin still works
+without restart — the plugin doesn't hold the admin password
+anywhere; it relies on PeerTube's `userAuthenticated()` to
+generate the bypass token from the validated owner JWT. (Earlier
+revisions of this package DID cache the admin password in the
+auth-proxy sidecar and required a container restart after a
+password reset; the move to PeerTube's native external-auth API
+removed that coupling.)
 
 ## What's not configured
 

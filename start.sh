@@ -676,54 +676,47 @@ if ! kill -0 "$CADDY_PID" 2>/dev/null; then
 fi
 
 # -----------------------------------------------------------------
-# Start auth-proxy sidecar (OpenHost zone_auth → PeerTube OAuth2 SSO)
+# Install + configure the OpenHost SSO PeerTube plugin
 # -----------------------------------------------------------------
-# This is the layer the OpenHost router actually talks to.  It
-# sits in front of Caddy on the public-facing port (9000), passes
-# anonymous + federation traffic through unchanged, and for the
-# zone owner serves a one-time HTML trampoline on /__openhost-sso
-# that mints a PeerTube OAuth2 token from /api/v1/users/token and
-# writes it to localStorage so the SPA picks it up.  See
-# auth_proxy.py module docstring for the full design.
+# The plugin lives in /opt/openhost-peertube/peertube-plugin-auth-openhost-sso/
+# (copied in by the Dockerfile) and is installed into the running
+# PeerTube via the standard plugin admin API.  Mirroring the
+# pattern openhost-miniflux uses for AUTH_PROXY_HEADER and
+# openhost-plane.so uses for its check-session sidecar:
+# the app's own auth machinery is what logs the user in.  The
+# sidecar's only job is bouncing the owner browser to the
+# plugin's auto-login URL on first visit.
 #
-# Runs as a dedicated ``openhost-authproxy`` user (not ``nobody``).
-# This is least-privilege: the auth-proxy holds the PeerTube
-# admin credential, so it must NOT share an identity with any
-# other long-lived process in the container.  Caddy (also
-# loopback-only) runs as ``nobody`` — if we used ``nobody`` for
-# the auth-proxy too, a Caddy RCE would yield read access to the
-# admin password.  The dedicated user means a Caddy compromise
-# cannot read /data/app_data/peertube/admin-password.txt.
-#
-# The user has no shell, no home dir, no membership in any
-# group besides its own.  See the Dockerfile for the
-# groupadd / useradd that creates it.
+# We talk to the PeerTube admin API as the root user using the
+# admin password generated above.  Idempotent: we read the
+# current plugin list first and skip install if already present.
+# Same for the openhost-router-url setting — we always re-PUT it
+# because OPENHOST_ROUTER_URL can change across container
+# restarts (e.g. when the operator moves to a new host).
 
-# Make the admin-password file readable by the auth-proxy alone.
-# The file is created by gen_secret() above with mode 0600 owned
-# by root.  We chgrp it to ``openhost-authproxy`` (the dedicated
-# group the Dockerfile creates for the sidecar) and chmod 640 —
-# root can still write, the auth-proxy process (which runs as
-# ``openhost-authproxy``) can read, every other process in the
-# container — including Caddy running as ``nobody`` — gets
-# nothing.  This is least-privilege: even a Caddy RCE can't
-# steal the PeerTube admin credential.
-chown root:openhost-authproxy "$ADMIN_PW_FILE"
-chmod 640 "$ADMIN_PW_FILE"
-# The secrets dir starts as 0700 root:root.  We need the
-# auth-proxy user to be able to traverse it (open the file by
-# path), so we chgrp the dir to ``openhost-authproxy`` and set
-# mode 0710 — root has full access, group members can traverse
-# + look up entries by name (but not list the directory
-# contents), and everyone else gets nothing.
-chown root:openhost-authproxy "$SECRETS_DIR"
-chmod 710 "$SECRETS_DIR"
+PLUGIN_DIR=/opt/openhost-peertube/peertube-plugin-auth-openhost-sso
+PLUGIN_NPM_NAME=peertube-plugin-auth-openhost-sso
 
-# Construct the canonical Host header value PeerTube enforces on
-# /api/v1/oauth-clients/local — that's webserver.hostname plus the
-# port if it's non-default for the scheme (HTTPS != 443, HTTP != 80).
-# The bridge needs this to talk to PeerTube directly (loopback)
-# without bouncing through Caddy.
+if [[ -z "${OPENHOST_ROUTER_URL:-}" ]]; then
+    log "FATAL: \$OPENHOST_ROUTER_URL is not set; the SSO plugin needs it"
+    log "  to fetch the OpenHost router's JWKS for owner JWT verification."
+    log "  This variable is normally injected by OpenHost; if it isn't,"
+    log "  the openhost-core deployment is broken."
+    early_exit_teardown
+    exit 1
+fi
+
+# Mint a short-lived OAuth token for the local root user — exactly
+# the same flow PeerTube's own admin UI uses on login.  The token
+# is good for ~24h; we use it for a few seconds and let it expire
+# naturally.
+log "Minting admin OAuth token for plugin install"
+PT_LOOPBACK="http://127.0.0.1:9001"
+
+# Helper: curl with the canonical Host header so PeerTube's
+# /api/v1/oauth-clients/local handler accepts the request.  That
+# endpoint enforces a strict Host == webserver.hostname check;
+# the loopback connect would otherwise fail with 403.
 case "$PT_HTTPS:$PT_PORT" in
     true:443|false:80)
         CANONICAL_HOST="$PT_HOSTNAME"
@@ -733,21 +726,121 @@ case "$PT_HTTPS:$PT_PORT" in
         ;;
 esac
 
-# Validate that OPENHOST_ROUTER_URL is set BEFORE launching the
-# auth-proxy.  The sidecar would refuse to start without it (and
-# emit a clear error to stderr), but our supervisor would then
-# log the generic "auth-proxy exited during startup" — which
-# misleads the operator into thinking the sidecar itself is at
-# fault.  Validate here so the failure message points at the
-# right environment variable.
-if [[ -z "${OPENHOST_ROUTER_URL:-}" ]]; then
-    log "FATAL: \$OPENHOST_ROUTER_URL is not set; auth-proxy needs it"
-    log "  to fetch the OpenHost router's JWKS for owner JWT verification."
-    log "  This variable is normally injected by OpenHost; if it isn't,"
-    log "  the openhost-core deployment is broken."
+# Wait for /api/v1/oauth-clients/local to respond — first-boot
+# Sequelize sync can lag the TCP-listen by ~30s.
+log "Waiting for PeerTube /api/v1/oauth-clients/local"
+for _ in $(seq 1 60); do
+    code=$(curl -sS -o /dev/null -w '%{http_code}' \
+        -H "Host: $CANONICAL_HOST" \
+        "$PT_LOOPBACK/api/v1/oauth-clients/local" || true)
+    if [[ "$code" == "200" ]]; then
+        break
+    fi
+    sleep 1
+done
+
+OAUTH_CLIENT_JSON=$(curl -sS \
+    -H "Host: $CANONICAL_HOST" \
+    "$PT_LOOPBACK/api/v1/oauth-clients/local")
+PT_CLIENT_ID=$(printf '%s' "$OAUTH_CLIENT_JSON" | \
+    python3 -c "import json,sys; print(json.load(sys.stdin)['client_id'])")
+PT_CLIENT_SECRET=$(printf '%s' "$OAUTH_CLIENT_JSON" | \
+    python3 -c "import json,sys; print(json.load(sys.stdin)['client_secret'])")
+
+# POST to /api/v1/users/token with grant_type=password.  Pass the
+# admin password through stdin (--data-binary @-) so it never
+# lands in argv.
+TOKEN_JSON=$(printf 'client_id=%s&client_secret=%s&grant_type=password&response_type=code&username=root&password=%s' \
+        "$PT_CLIENT_ID" "$PT_CLIENT_SECRET" "$PT_ADMIN_PW" \
+    | curl -sS \
+        -H "Host: $CANONICAL_HOST" \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        --data-binary @- \
+        "$PT_LOOPBACK/api/v1/users/token")
+PT_ACCESS_TOKEN=$(printf '%s' "$TOKEN_JSON" | \
+    python3 -c "import json,sys; print(json.load(sys.stdin)['access_token'])")
+if [[ -z "$PT_ACCESS_TOKEN" ]]; then
+    log "FATAL: could not obtain PeerTube admin token for plugin install"
     early_exit_teardown
     exit 1
 fi
+
+# Check whether the plugin is already installed.  PeerTube returns
+# {data: [...], total: N}; we check whether any element has the
+# matching npmName.  ``installed`` is the parameterless plugin
+# list (only includes installed/enabled plugins, excluding
+# previously uninstalled ones), so this check is correct on
+# first boot AND on a re-deploy after a previous remove.
+INSTALLED=$(curl -sS \
+    -H "Host: $CANONICAL_HOST" \
+    -H "Authorization: Bearer $PT_ACCESS_TOKEN" \
+    "$PT_LOOPBACK/api/v1/plugins?count=100" | \
+    python3 -c "import json,sys; d=json.load(sys.stdin); print(any(x['name']=='auth-openhost-sso' for x in d.get('data', [])))")
+
+if [[ "$INSTALLED" == "True" ]]; then
+    log "Plugin auth-openhost-sso already installed"
+else
+    log "Installing plugin auth-openhost-sso from $PLUGIN_DIR"
+    INSTALL_RESPONSE=$(curl -sS -w '\n%{http_code}' \
+        -H "Host: $CANONICAL_HOST" \
+        -H "Authorization: Bearer $PT_ACCESS_TOKEN" \
+        -H "Content-Type: application/json" \
+        --data "{\"path\": \"$PLUGIN_DIR\"}" \
+        "$PT_LOOPBACK/api/v1/plugins/install")
+    INSTALL_CODE="${INSTALL_RESPONSE##*$'\n'}"
+    INSTALL_BODY="${INSTALL_RESPONSE%$'\n'*}"
+    if [[ "$INSTALL_CODE" != "200" && "$INSTALL_CODE" != "204" ]]; then
+        log "FATAL: plugin install failed (HTTP $INSTALL_CODE): $INSTALL_BODY"
+        early_exit_teardown
+        exit 1
+    fi
+fi
+
+# Always re-set the openhost-router-url setting.  PeerTube
+# accepts a JSON body of {settings: {<name>: <value>}} on
+# PUT /api/v1/plugins/<npmName>/settings.  Even if the value
+# hasn't changed across boots the PUT triggers
+# settingsManager.onSettingsChange in the plugin, which
+# re-builds the JWKS client — useful in case the operator
+# rotated keys on the OpenHost router side without restarting
+# us.
+log "Configuring plugin (router URL: $OPENHOST_ROUTER_URL)"
+SETTINGS_PAYLOAD=$(python3 -c "import json,os; print(json.dumps({'settings': {'openhost-router-url': os.environ['OPENHOST_ROUTER_URL']}}))")
+SETTINGS_RESPONSE=$(curl -sS -w '\n%{http_code}' \
+    -H "Host: $CANONICAL_HOST" \
+    -H "Authorization: Bearer $PT_ACCESS_TOKEN" \
+    -H "Content-Type: application/json" \
+    -X PUT \
+    --data "$SETTINGS_PAYLOAD" \
+    "$PT_LOOPBACK/api/v1/plugins/$PLUGIN_NPM_NAME/settings")
+SETTINGS_CODE="${SETTINGS_RESPONSE##*$'\n'}"
+SETTINGS_BODY="${SETTINGS_RESPONSE%$'\n'*}"
+if [[ "$SETTINGS_CODE" != "204" ]]; then
+    log "FATAL: plugin settings update failed (HTTP $SETTINGS_CODE): $SETTINGS_BODY"
+    early_exit_teardown
+    exit 1
+fi
+
+# -----------------------------------------------------------------
+# Start auth-proxy sidecar (OpenHost zone_auth → SSO bounce)
+# -----------------------------------------------------------------
+# The sidecar binds the public-facing port (9000) on behalf of
+# the OpenHost router.  Two responsibilities:
+#   * Pass-through proxy for federation + anonymous + asset
+#     traffic.
+#   * Owner bounce: when an HTML navigation arrives carrying
+#     a verified ``zone_auth`` cookie and no marker cookie, the
+#     sidecar 302-redirects the browser to the plugin's
+#     auto-login route.  The plugin verifies the same JWT and
+#     calls userAuthenticated, which redirects to
+#     /login?externalAuthToken=… and the SPA finishes the login
+#     via PeerTube's native flow.
+#
+# Runs as a dedicated ``openhost-authproxy`` user (not ``nobody``
+# and not the same user as Caddy).  Least-privilege: even though
+# the sidecar no longer holds the admin password, isolating
+# every container daemon to its own UID means a compromise of
+# any one process can't read another's data files.
 
 log "Starting auth-proxy sidecar on :${AUTH_PROXY_LISTEN_PORT} -> Caddy :${CADDY_PORT}"
 
@@ -755,11 +848,6 @@ AUTH_PROXY_LOG_LEVEL="${AUTH_PROXY_LOG_LEVEL:-INFO}" \
 AUTH_PROXY_LISTEN_PORT="$AUTH_PROXY_LISTEN_PORT" \
 AUTH_PROXY_UPSTREAM_HOST="127.0.0.1" \
 AUTH_PROXY_UPSTREAM_PORT="$CADDY_PORT" \
-AUTH_PROXY_PEERTUBE_HOST="127.0.0.1" \
-AUTH_PROXY_PEERTUBE_PORT="9001" \
-AUTH_PROXY_CANONICAL_HOST="$CANONICAL_HOST" \
-AUTH_PROXY_ADMIN_USER="root" \
-AUTH_PROXY_ADMIN_PW_FILE="$ADMIN_PW_FILE" \
 OPENHOST_ROUTER_URL="$OPENHOST_ROUTER_URL" \
     runuser -u openhost-authproxy --preserve-environment -- \
         python3 /opt/openhost-peertube/auth_proxy.py &

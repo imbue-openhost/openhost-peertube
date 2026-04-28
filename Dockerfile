@@ -91,19 +91,31 @@ RUN if [ -d /var/lib/postgresql/15/main ]; then \
 # redis.conf at boot pointing at $OPENHOST_APP_DATA_DIR/redis.
 RUN rm -rf /var/lib/redis/* /etc/redis/redis.conf || true
 
-# Copy our startup wrapper + Caddyfile + auth-proxy sidecar.
+# Copy our startup wrapper + Caddyfile + auth-proxy sidecar +
+# the bundled SSO plugin.
+#
 # start.sh generates DB + Redis + admin passwords on first boot,
-# persists them under $OPENHOST_APP_DATA_DIR, and starts postgres,
-# redis, Caddy (host-rewriter mid-tier), the PeerTube node
-# process, and the Python auth-proxy sidecar (which sits in front
-# of Caddy and bridges OpenHost's zone_auth cookie to a freshly
-# minted PeerTube OAuth2 token via a one-time client-side
-# trampoline page).  Five long-lived processes total, supervised
-# by a single bash parent with `wait -n`.
+# persists them under $OPENHOST_APP_DATA_DIR, starts postgres,
+# redis, the PeerTube node process, Caddy (host-rewriter
+# mid-tier), and the Python auth-proxy sidecar.  After PeerTube
+# is up, start.sh authenticates as root and installs/configures
+# the bundled ``peertube-plugin-auth-openhost-sso`` plugin via
+# the standard PeerTube admin API — this is the plugin that
+# implements the actual owner-sign-in flow via PeerTube's
+# native ``registerExternalAuth`` machinery.  Five long-lived
+# processes plus the in-PeerTube plugin, supervised by a single
+# bash parent with `wait -n`.
 COPY start.sh /opt/openhost-peertube/start.sh
 COPY Caddyfile /opt/openhost-peertube/Caddyfile
 COPY auth_proxy.py /opt/openhost-peertube/auth_proxy.py
-RUN chmod +x /opt/openhost-peertube/start.sh
+COPY peertube-plugin-auth-openhost-sso /opt/openhost-peertube/peertube-plugin-auth-openhost-sso
+RUN chmod +x /opt/openhost-peertube/start.sh \
+ # The plugin install API hands the path to PeerTube which calls
+ # ``pnpm add file:<path>``.  pnpm runs as the peertube user so
+ # the path must be readable by that user.  /opt/...-sso is
+ # owned by root by default; chown so peertube can read.
+ && chown -R peertube:peertube \
+        /opt/openhost-peertube/peertube-plugin-auth-openhost-sso
 
 # OpenHost will route http://peertube.<zone>/... to this port.
 # The auth-proxy sidecar (auth_proxy.py) binds :9000.  Behind it,

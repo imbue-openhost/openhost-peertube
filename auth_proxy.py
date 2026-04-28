@@ -1,13 +1,9 @@
 """OpenHost auth-sidecar for PeerTube — owner SSO without breaking federation.
 
-Two rails for traffic flow, plus three sidecar-served endpoints
-under ``/__openhost-sso/*`` (``login``, ``mint-token``, ``logout``)
-that drive the SSO bridge.  The two traffic rails mirror the
-openhost-nextcloud pattern but the SSO endpoints are
-PeerTube-specific because PeerTube's SPA reads its OAuth2 token
-from ``localStorage`` rather than a cookie.
+A thin reverse proxy that sits between the OpenHost router and the
+Caddy → PeerTube backend.  Two responsibilities:
 
-1. Anonymous + federation (the default).  Almost every URL on a
+1. Anonymous + federation pass-through.  Almost every URL on a
    PeerTube instance is reachable without login: a remote Mastodon
    server fetches an actor object, an anonymous browser watches a
    public video, the federated player downloads HLS chunks, the
@@ -15,83 +11,58 @@ from ``localStorage`` rather than a cookie.
    pass through this sidecar untouched — same body, same headers,
    no SSO header injected, no Authorization header rewritten.
 
-2. Owner SSO via trampoline.  When the zone owner (someone holding
-   a router-issued ``zone_auth`` JWT cookie) navigates to the SPA
-   root or to a known-protected path, the sidecar serves a tiny
-   self-contained HTML page from ``/__openhost-sso/login`` that:
-       * receives a freshly minted PeerTube OAuth2 access token
-         from the sidecar (the sidecar speaks PeerTube's own
-         /api/v1/oauth-clients/local + /api/v1/users/token API,
-         using the persisted ``admin-password.txt`` as a
-         service-account credential just on the loopback);
-       * writes seven items to localStorage:
-              - the OAuth token triple (``access_token``,
-                ``refresh_token``, ``token_type``); and
-              - the four user-identity fields (``id``, ``username``,
-                ``email``, ``role``) — without these the SPA
-                bootstrap (``loadUser`` in ``main.js``) treats the
-                visitor as anonymous EVEN with valid tokens.
-          These are the exact keys the PeerTube SPA reads on
-          bootstrap (see
-          /app/client/src/root-helpers/users/oauth-user-tokens.ts
-          for the token triple and the SPA's
-          user-local-storage-keys helpers for the identity quartet).
-          The sidecar fetches the identity fields via
-          ``/api/v1/users/me`` with the freshly-minted token before
-          handing them to the trampoline.
-   The mint-token response from the sidecar additionally carries
-   a ``Set-Cookie: openhost_pt_sso_until=<unix-ts>; Path=/; ...``
-   header so subsequent visits skip the trampoline until the
-   marker expires.  (The cookie is set server-side; the trampoline
-   JS itself only touches localStorage.)  Once both write paths
-   complete, the JS redirects to the original URL.
-   On subsequent visits, the marker cookie is present and unexpired,
-   so the sidecar passes the request through untouched and the SPA
-   reads the still-valid token from localStorage on its own.
+2. Owner SSO bounce.  When the zone owner (someone holding a
+   router-issued ``zone_auth`` JWT cookie, ``sub == "owner"``)
+   visits the SPA root or any non-federation HTML page WITHOUT a
+   ``openhost_pt_sso_marker`` cookie, the sidecar redirects them
+   to ``/plugins/auth-openhost-sso/router/auto-login`` — a route
+   exposed by the bundled
+   ``peertube-plugin-auth-openhost-sso`` plugin.  The plugin
+   verifies the same JWT against the same JWKS and calls
+   PeerTube's standard ``userAuthenticated`` external-auth
+   helper, which generates a one-time ``externalAuthToken``
+   and redirects the browser to ``/login?externalAuthToken=…``.
+   The SPA's ordinary login page exchanges that token for OAuth
+   credentials via the standard ``/api/v1/users/token`` endpoint
+   and runs its full native login flow — which primes
+   ``localStorage`` exactly the way a real password login does.
 
-   ``/__openhost-sso/logout`` (POST-only — see the handler) clears
-   the marker cookie so the next owner visit re-trampolines and
-   replaces stale localStorage tokens.  Useful after the operator
-   resets the admin password (the sidecar caches the password at
-   startup, so a reset requires a container restart anyway, but
-   the logout endpoint at least stops the browser from holding
-   onto the stale OAuth tokens after the marker invalidates).
+   The sidecar sets ``openhost_pt_sso_marker`` on the bounce
+   redirect so the SPA's post-login navigations don't trigger
+   another bounce while the SPA is in the middle of exchanging
+   the token.  The marker has a short TTL (5 minutes) — long
+   enough to cover the redirect chain plus normal navigation,
+   short enough that an owner who explicitly logs out of
+   PeerTube gets a fresh SSO trampoline on their next page
+   load instead of being stuck anonymous.
 
-The trampoline is the SPA-friendly equivalent of nextcloud's
-header-stamping SSO.  PeerTube stores its OAuth token in
-``localStorage`` (not a cookie) so we have no choice but to bridge
-through a one-time client-side write.  Mastodon uses the same trick
-in its various SSO plugins.
+This file is intentionally simple.  In an earlier revision it
+also minted PeerTube OAuth tokens directly (calling
+``/api/v1/users/token`` with grant_type=password and the cached
+admin password) and primed ``localStorage`` via an inline HTML
+trampoline.  That approach worked end-to-end as far as the API
+went but failed to fully bootstrap the SPA: the SPA's auth
+state machine reads more localStorage keys than the trampoline
+populated (id, username, email, role on top of the
+access/refresh/type triple), and matching the SPA's internal
+contract against a moving upstream is brittle.  Routing through
+the plugin's ``registerExternalAuth`` flow puts ALL the
+identity-bootstrap responsibility back inside PeerTube — which
+both fixes the bug and removes ~700 lines of trampoline-state
+machinery from this file.
 
-Why not just always inject ``Authorization: Bearer <token>`` on
-proxied requests?  The SPA running in the browser does not know we
-did that — it would still show the "Login" button, fetch the user's
-own profile as anonymous, etc.  The trampoline is what propagates
-the token into the browser's localStorage so the SPA's own auth
-state machine sees the user as logged in.
+Federation is wholly unaffected: remote ActivityPub servers
+don't carry ``zone_auth``, don't reach the bounce, and see
+verbatim pass-through.
 
-Federation is wholly unaffected: federation requests come from
-remote ActivityPub servers that don't carry zone_auth, don't go
-through the trampoline, and don't see any rewriting at this layer.
-
-Anonymous web visitors are also unaffected: with no zone_auth
-cookie, the trampoline is never triggered and they get the standard
-anonymous PeerTube experience.
+Anonymous web visitors are also unaffected: no ``zone_auth``,
+no bounce.
 
 Header sanitation: client-supplied ``X-OpenHost-User`` and
 ``X-OpenHost-Is-Owner`` headers are stripped on every request
-that the sidecar PROXIES UPSTREAM — i.e., everything that
-reaches ``_proxy()`` or ``_proxy_websocket()``, which covers
-both federation paths and the owner pass-through after the
-trampoline.  These are the headers the OpenHost router uses to
-assert owner identity to the app; forging them must never
-grant privilege downstream.
-
-The three sidecar-served SSO endpoints (``/__openhost-sso/login``,
-``/.../mint-token``, ``/.../logout``) do NOT proxy upstream and
-therefore don't run the strip step — but they also never use
-the trust headers for any decision.  Owner authentication on
-those paths is exclusively the JWT signature check.
+that this sidecar PROXIES UPSTREAM.  These are the headers the
+OpenHost router uses to assert owner identity to apps; forging
+them must never grant privilege downstream.
 
 We do NOT strip ``Authorization``: the SPA, mobile app, and any
 third-party PeerTube client carries its OAuth2 access token in
@@ -104,8 +75,6 @@ inspecting it.
 
 from __future__ import annotations
 
-import html
-import json
 import logging
 import os
 import re
@@ -127,38 +96,34 @@ ZONE_COOKIE = "zone_auth"
 JWKS_PATH = "/.well-known/jwks.json"
 JWKS_REFRESH_INTERVAL_SEC = 600
 
-# SSO trampoline path.  Two underscores at the start by convention to
-# minimise the chance of clashing with a real PeerTube route.  PeerTube
-# does not currently route anything matching ``/__openhost-sso/*``.
-SSO_BASE = "/__openhost-sso"
-SSO_LOGIN_PATH = f"{SSO_BASE}/login"
-SSO_TOKEN_PATH = f"{SSO_BASE}/mint-token"   # internal JSON endpoint
-SSO_LOGOUT_PATH = f"{SSO_BASE}/logout"
+# Plugin route the sidecar redirects owner navigations to.  The
+# matching plugin source lives in ``peertube-plugin-auth-openhost-sso/``
+# and is installed onto the running PeerTube instance by
+# ``start.sh`` on first boot via ``POST /api/v1/plugins/install``.
+# We use the un-versioned form of the plugin custom-router URL
+# (``/plugins/<name>/router/<route>``) so a plugin version bump
+# doesn't require also updating this constant.
+SSO_BOUNCE_PATH = "/plugins/auth-openhost-sso/router/auto-login"
 
-# Marker cookie set by the trampoline so subsequent visits skip the
-# round-trip.  Value is the unix epoch of expiry; presence-and-not-
-# yet-expired is the trigger.
-SSO_MARKER_COOKIE = "openhost_pt_sso_until"
+# Marker cookie the sidecar sets when it bounces an owner to the
+# plugin auto-login route.  Presence (regardless of value) means
+# "skip the bounce" — the owner is in the middle of, or has
+# recently completed, the SSO flow.  The cookie has a short TTL
+# (see SSO_MARKER_TTL_SEC); when it expires, the next owner
+# navigation re-bounces through the plugin.  A re-bounce on an
+# already-logged-in SPA is harmless: the plugin redirects to
+# /login with a fresh externalAuthToken, the SPA's login page
+# exchanges it (silently, since the SPA is already in a logged-in
+# state), and updates localStorage with the refreshed tokens.
+SSO_MARKER_COOKIE = "openhost_pt_sso_marker"
 
-# When we mint a PeerTube token, PeerTube returns ``expires_in`` in
-# seconds (typically ~86400).  We want the marker cookie to expire
-# BEFORE the access token so the next owner navigation re-trampolines
-# while there's still time left on the token (this avoids the SPA
-# ever seeing a 401 for a stale token).  The marker's lifetime is
-# computed as ``expires_in - SSO_MARKER_SAFETY_MARGIN_SEC``, capped
-# below by 60s (so a tiny TTL doesn't produce a negative or near-zero
-# marker that re-fires on every navigation).
-#
-# 1 hour of headroom means: with the typical 24h PeerTube token, the
-# marker lasts 23h and we re-mint shortly before expiry.  With a
-# hypothetical 30-minute token, headroom shrinks to 60s — still
-# correct, just less efficient.
-SSO_MARKER_SAFETY_MARGIN_SEC = 60 * 60
-
-# Short-lived marker we set on mint-failure paths so the browser
-# doesn't loop the trampoline if PeerTube is briefly unavailable.
-# After this many seconds the next owner navigation will retry.
-SSO_FAILURE_MARKER_SEC = 5 * 60
+# How long the marker cookie lives.  Five minutes is plenty for
+# the redirect chain (auto-login -> login?externalAuthToken=… ->
+# /api/v1/users/token -> /) to complete with margin for slow
+# networks, but short enough that a logged-out owner gets
+# re-trampolined the next time they visit the page after their
+# explicit logout.
+SSO_MARKER_TTL_SEC = 5 * 60
 
 # Maximum number of bytes to copy in a single chunk between client and
 # upstream.  64 KiB is comfortably below typical socket buffer sizes.
@@ -244,13 +209,19 @@ FEDERATION_PATH_PATTERNS = [
     re.compile(r"^/tracker(/|$)"),
     re.compile(r"^/api/v1/ping$"),
     # The OAuth bootstrap endpoints — anonymous, used by the SPA's
-    # own login flow and by any third-party app needing to
-    # authenticate.  The trampoline ITSELF calls these (loopback)
-    # to mint the owner's token; if we trampolined them we'd
-    # infinite-loop.
+    # own login flow (including the post-SSO externalAuthToken
+    # exchange) and by any third-party app needing to authenticate.
     re.compile(r"^/api/v1/oauth-clients(/|$)"),
     re.compile(r"^/api/v1/users/token$"),
     re.compile(r"^/api/v1/users/revoke-token$"),
+    # The login page itself — we just bounced the owner here from
+    # the plugin's auto-login route.  Bouncing them BACK would
+    # produce a redirect loop.
+    re.compile(r"^/login(/|$|\?)"),
+    # The external-auth plugin route family — the bounce target
+    # itself plus any future per-version variants.  Bouncing any
+    # of these would loop.
+    re.compile(r"^/plugins/auth-openhost-sso(/|$)"),
     # SPA assets — anonymous viewers need these to load the
     # client.  Asset paths are loaded with Accept: */* anyway so
     # the trampoline filter wouldn't fire on them, but listing
@@ -484,234 +455,6 @@ def _verify_owner(token: str, jwks: JwksCache) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# PeerTube OAuth2 bridge
-# ---------------------------------------------------------------------------
-class PeerTubeOauthBridge:
-    """Mints OAuth2 access tokens for the ``root`` PeerTube user.
-
-    PeerTube's standard local OAuth2 flow is a two-step:
-        1. GET /api/v1/oauth-clients/local
-           returns {"client_id": "...", "client_secret": "..."}
-           (these rotate on PeerTube startup but only those two
-           values, not the user credentials themselves).
-        2. POST /api/v1/users/token  with
-           grant_type=password, client_id, client_secret, username, password
-           returns {"access_token": "...", "refresh_token": "...",
-                    "token_type": "Bearer", "expires_in": 86400, ...}.
-
-    Both calls go DIRECTLY to PeerTube on PEERTUBE_HOST:PEERTUBE_PORT
-    — they bypass the Caddy mid-tier.  This is necessary because
-    PeerTube's ``/api/v1/oauth-clients/local`` handler requires the
-    inbound Host header to match the canonical webserver.hostname
-    EXACTLY: any other value (including ``127.0.0.1:9090`` which
-    Caddy would forward without an X-Forwarded-Host to rewrite from)
-    returns 403.  The bridge has the canonical hostname available
-    via the ``canonical_host`` constructor argument (start.sh
-    derives it from ``PT_HTTPS`` + ``PT_PORT`` and passes the value
-    as ``$AUTH_PROXY_CANONICAL_HOST``), so we just send it directly.
-
-    We DO NOT cache the access token globally; we mint a fresh one
-    each time the trampoline fires for an owner visit, and let the
-    SPA's localStorage be the per-browser cache.  PeerTube tokens
-    are short enough (~24h) and minting is cheap (~50ms loopback),
-    so the simplicity is worth it.
-
-    Client_id / client_secret are cached because they don't change
-    until PeerTube restarts.  Specifically: on a token-endpoint
-    HTTP 400 (which PeerTube returns when the cached creds are
-    stale because PeerTube restarted between mints), we
-    force-refresh the creds and retry the mint exactly once.
-    Other failures (network errors, 5xx, 400 on the second
-    attempt) raise immediately — no further retry.
-    """
-
-    def __init__(
-        self,
-        peertube_host: str,
-        peertube_port: int,
-        canonical_host: str,
-        username: str,
-        password: str,
-    ) -> None:
-        self._peertube_host = peertube_host
-        self._peertube_port = peertube_port
-        # The canonical Host header value PeerTube expects on its
-        # ``/api/v1/oauth-clients/local`` endpoint.  Includes the
-        # explicit port only when the public URL has a non-standard
-        # one (PeerTube formats this as ``host`` for :443/HTTPS,
-        # ``host:port`` otherwise).  We honor the value passed by
-        # start.sh verbatim — it's authoritative.
-        self._canonical_host = canonical_host
-        self._username = username
-        self._password = password
-        self._client_id: str | None = None
-        self._client_secret: str | None = None
-        self._client_lock = threading.Lock()
-
-    def _peertube_url(self, path: str) -> str:
-        return f"http://{self._peertube_host}:{self._peertube_port}{path}"
-
-    def _request_headers(self) -> dict[str, str]:
-        # Override the Host header so PeerTube's canonical-Host
-        # check passes.  Python's requests honors a Host header in
-        # the user-supplied dict (it passes through to urllib3 which
-        # passes through to http.client).
-        return {"Host": self._canonical_host}
-
-    def _fetch_client_creds(self, force: bool = False) -> tuple[str, str]:
-        # Fast path: cache hit.  Take the lock just for the
-        # snapshot read so concurrent readers don't tear the
-        # tuple.  Mirrors the JwksCache.get pattern.
-        with self._client_lock:
-            cached = (self._client_id, self._client_secret)
-        if not force and cached[0] and cached[1]:
-            return cached  # type: ignore[return-value]
-
-        # Slow path: fetch from PeerTube.  Don't hold the cache
-        # lock across the network I/O — that would serialize
-        # every concurrent owner mint behind a 10-second worst-
-        # case timeout.  Multiple concurrent fetches are wasteful
-        # but not unsafe: PeerTube's client creds rotate only on
-        # PeerTube restart, so any racing fetches will all return
-        # the same value.
-        url = self._peertube_url("/api/v1/oauth-clients/local")
-        try:
-            with requests.get(
-                url, headers=self._request_headers(), timeout=10
-            ) as resp:
-                resp.raise_for_status()
-                data = resp.json()
-        except (json.JSONDecodeError, ValueError) as exc:
-            # Distinct error for the JSON-parse failure case so the
-            # log surfaces it as a parse error rather than a
-            # generic exception (a foreseeable failure when the
-            # upstream responds with HTML — e.g. a
-            # misconfiguration that exposes Caddy's default error
-            # page in place of PeerTube).
-            raise RuntimeError(
-                "PeerTube /oauth-clients/local returned non-JSON response"
-            ) from exc
-        cid = data.get("client_id") if isinstance(data, dict) else None
-        csec = data.get("client_secret") if isinstance(data, dict) else None
-        if not cid or not csec:
-            raise RuntimeError(
-                "PeerTube /oauth-clients/local returned no client_id"
-            )
-        # Publish the new creds atomically.
-        with self._client_lock:
-            self._client_id = cid
-            self._client_secret = csec
-        return cid, csec
-
-    def fetch_user_info(self, access_token: str, token_type: str) -> dict:
-        """Fetch /api/v1/users/me with the freshly-minted token.
-
-        Returns the parsed JSON response (a dict containing at least
-        ``id``, ``username``, ``email``, ``role.id``).  Raises on any
-        error; caller logs.
-
-        The SPA's bootstrap (``loadUser`` in main.js) refuses to
-        rebuild an authenticated user state from localStorage unless
-        BOTH the OAuth tokens AND four user-identity fields
-        (``id``, ``username``, ``email``, ``role``) are present.
-        Without the user-identity fields the visitor sees the
-        anonymous UI even though tokens are valid — so we must
-        prime them via /users/me as part of the trampoline mint.
-        """
-        url = self._peertube_url("/api/v1/users/me")
-        headers = self._request_headers()
-        # PeerTube's auth uses the standard ``Authorization: Bearer
-        # <access_token>`` scheme; ``token_type`` is "Bearer" in
-        # practice but we honour what the upstream returned in case
-        # a future PeerTube version uses a different scheme name.
-        headers["Authorization"] = f"{token_type} {access_token}"
-        try:
-            with requests.get(url, headers=headers, timeout=10) as resp:
-                resp.raise_for_status()
-                data = resp.json()
-        except (json.JSONDecodeError, ValueError) as exc:
-            raise RuntimeError(
-                "PeerTube /users/me returned non-JSON response"
-            ) from exc
-        if not isinstance(data, dict):
-            raise RuntimeError(
-                f"PeerTube /users/me response is not a JSON object "
-                f"(got {type(data).__name__})"
-            )
-        return data
-
-    def mint_token(self) -> dict:
-        """Mint a new OAuth2 access token for the configured user.
-
-        Returns the parsed JSON response — the SPA expects keys
-        ``access_token``, ``refresh_token``, ``token_type``, and
-        ``expires_in``.  Raises on any error; caller logs.
-
-        On a 400 from the token endpoint (which PeerTube returns when
-        the client_id/secret are stale because PeerTube restarted),
-        we transparently re-fetch the client creds and retry once.
-        """
-        # Initialised to 0 so that even if the loop short-circuits in
-        # ways the type checker can't see, the post-loop ``raise`` has
-        # a defined value.  In practice, every code path through the
-        # ``with`` either ``return``s on 200, sets ``status_was_400``
-        # explicitly, or assigns ``failed_status`` — but a future
-        # refactor that adds a path could otherwise hit a NameError.
-        failed_status: int = 0
-        for attempt in (0, 1):
-            client_id, client_secret = self._fetch_client_creds(
-                force=(attempt == 1)
-            )
-            url = self._peertube_url("/api/v1/users/token")
-            data = {
-                "client_id": client_id,
-                "client_secret": client_secret,
-                "grant_type": "password",
-                "response_type": "code",
-                "username": self._username,
-                "password": self._password,
-            }
-            with requests.post(
-                url,
-                data=data,
-                headers=self._request_headers(),
-                timeout=10,
-            ) as resp:
-                if resp.status_code == 200:
-                    return resp.json()
-                if resp.status_code == 400 and attempt == 0:
-                    # Likely stale client creds.  Force-refresh on
-                    # the next attempt.  ``continue`` exits the
-                    # ``with`` block first, so the response is
-                    # closed and the urllib3 connection released
-                    # back to the pool before we retry.
-                    log.info(
-                        "PeerTube token mint got 400; refreshing client creds"
-                    )
-                    status_was_400 = True
-                else:
-                    status_was_400 = False
-                    failed_status = resp.status_code
-            if status_was_400:
-                continue
-            # Any other status, or 400 on the second attempt, is fatal
-            # for this request.  Don't include the response body in
-            # the log: PeerTube echoes the username back in error
-            # messages and our log destination is shared.
-            raise RuntimeError(
-                f"PeerTube token mint failed: HTTP {failed_status}"
-            )
-        # Unreachable: every iteration of the for loop above either
-        # returns on success, raises on terminal failure, or
-        # ``continue``s after the first 400.  Defensive raise so a
-        # future refactor that adds an unguarded path doesn't fall
-        # off the end of the function and return None to the
-        # caller (which would attempt to ``tokens["access_token"]``
-        # and crash with a less obvious traceback).
-        raise RuntimeError("PeerTube token mint loop exhausted unexpectedly")
-
-
-# ---------------------------------------------------------------------------
 # Streaming proxy core
 # ---------------------------------------------------------------------------
 class _CappedReader:
@@ -775,7 +518,6 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
     jwks: JwksCache | None = None
     upstream_host: str = "127.0.0.1"
     upstream_port: int = 9090
-    oauth_bridge: PeerTubeOauthBridge | None = None
 
     def log_message(self, format: str, *args) -> None:  # noqa: A002, N802
         path = getattr(self, "path", "")
@@ -822,531 +564,88 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
         except OSError as exc:
             log.debug("settimeout on client socket failed: %s", exc)
 
-        # SSO trampoline routes — handled wholly in-sidecar.
-        path_only = self.path.split("?", 1)[0].split("#", 1)[0]
-        if path_only == SSO_LOGIN_PATH:
-            self._handle_sso_login()
-            return
-        if path_only == SSO_TOKEN_PATH:
-            self._handle_sso_mint_token()
-            return
-        if path_only == SSO_LOGOUT_PATH:
-            self._handle_sso_logout()
-            return
-
-        # Federation surface OR no zone_auth — pass straight through.
-        # Owner-status-check happens only if the request looks like
-        # an owner browser visit that needs trampolining.
+        # Owner-bounce check: do we redirect this navigation to
+        # the plugin's auto-login route?  Only if all of:
+        #   * the request looks like a top-level navigation (HTML
+        #     accept), so we don't bounce an XHR or asset fetch
+        #     (which would corrupt the SPA's view of itself);
+        #   * the visitor IS the zone owner — verified by the
+        #     RS256 JWT signature on the zone_auth cookie;
+        #   * the request isn't already part of the federation/
+        #     anonymous surface (federation must never be
+        #     bounced — remote ActivityPub servers never carry
+        #     zone_auth anyway, but the explicit allow-list is
+        #     also our defense against misconfigured paths);
+        #   * the marker cookie isn't already present.  The
+        #     marker is the "I just bounced you, don't re-bounce"
+        #     flag we set on the bounce response and that the
+        #     browser sends back on every subsequent navigation
+        #     until it expires.
         cookies = _parse_cookie_header(self.headers.get("Cookie"))
         zone_token = cookies.get(ZONE_COOKIE, "")
-        marker_until = cookies.get(SSO_MARKER_COOKIE, "")
+        has_marker = bool(cookies.get(SSO_MARKER_COOKIE, ""))
 
         is_owner = False
         if zone_token and self.jwks is not None:
             is_owner = _verify_owner(zone_token, self.jwks)
 
-        # Should we trampoline THIS request?  Only if all of:
-        #   * the request looks like a top-level navigation (HTML
-        #     accept), so we don't trampoline an XHR or asset
-        #     fetch (which would corrupt the SPA's view of itself);
-        #   * the visitor is the owner;
-        #   * the request isn't already part of the federation/
-        #     anonymous surface;
-        #   * the marker cookie isn't already present + unexpired.
         accept = self.headers.get("Accept", "")
         is_html_navigation = (
             self.command == "GET"
             and "text/html" in accept.lower()
             and not _is_federation_path(self.path)
         )
-        marker_valid = self._marker_cookie_valid(marker_until)
 
-        if is_owner and is_html_navigation and not marker_valid:
-            self._redirect_to_trampoline()
+        if is_owner and is_html_navigation and not has_marker:
+            self._redirect_to_plugin_auto_login()
             return
 
         # Pass through.
         self._proxy()
 
-    @staticmethod
-    def _marker_cookie_valid(marker: str) -> bool:
-        if not marker:
-            return False
-        try:
-            until = int(marker)
-        except ValueError:
-            return False
-        return until > time.time()
+    # ----------------------------------------------------------------
+    # Owner-SSO bounce
+    # ----------------------------------------------------------------
+    def _redirect_to_plugin_auto_login(self) -> None:
+        """Redirect the owner to the plugin's auto-login route.
 
-    # ----------------------------------------------------------------
-    # SSO trampoline handlers
-    # ----------------------------------------------------------------
-    def _redirect_to_trampoline(self) -> None:
-        """Redirect an owner navigation to the SSO trampoline page."""
-        # Encode the original path so the trampoline can bounce us
-        # back after writing localStorage.  ``Location`` is sent in
-        # latin-1 over the wire; Python urlencode handles non-ASCII
-        # by percent-encoding.
+        Sets the marker cookie at the same time so the redirect
+        chain (``/auto-login`` -> ``/login?externalAuthToken=…``
+        -> ``/api/v1/users/token`` -> SPA bootstrap) doesn't
+        re-bounce on the way back.
+
+        The ``next=`` query param is the original path the visitor
+        was trying to reach — we percent-encode it via
+        ``_safe_next_path`` to defang open-redirect attacks before
+        echoing it.  The plugin currently ignores ``next`` (it
+        always lands on ``/login`` after the externalAuthToken
+        round-trip and then the SPA decides where to navigate),
+        but we pass it through for forward compatibility with a
+        future plugin version that honours it.
+        """
         next_url = _safe_next_path(self.path)
-        target = SSO_LOGIN_PATH + "?" + urllib.parse.urlencode({"next": next_url})
+        target = SSO_BOUNCE_PATH + "?" + urllib.parse.urlencode({"next": next_url})
+        marker_until = int(time.time() + SSO_MARKER_TTL_SEC)
         try:
             self.send_response(302)
             self.send_header("Location", target)
+            self.send_header("Set-Cookie", self._build_marker_cookie(marker_until))
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", "0")
             self.send_header("Connection", "close")
             self.end_headers()
         except OSError as exc:
-            log.debug("client disconnected during trampoline redirect: %s", exc)
-
-    def _handle_sso_login(self) -> None:
-        """Serve the trampoline HTML page.
-
-        The page itself is served regardless of whether the visitor
-        appears to be the owner — we will deny the actual token-mint
-        endpoint if their JWT doesn't verify, and the page just
-        shows an error in that case.  Serving the static HTML to
-        non-owners simplifies caching and lets a stale tab recover
-        gracefully without needing zone_auth at the page-load time.
-        """
-        # Parse ?next= to validate it's an origin-form path; never
-        # echo a foreign URL back (open-redirect risk).  If the
-        # parse fails for any reason we log at DEBUG and fall back
-        # to the safe default ``/`` — silent fallback would mask a
-        # systematic parser failure.
-        try:
-            parsed = urllib.parse.urlparse(self.path)
-            qs = urllib.parse.parse_qs(parsed.query)
-            raw_next = qs.get("next", ["/"])[0]
-        except Exception as exc:  # noqa: BLE001
-            log.debug("trampoline ?next= parse failed: %s", exc)
-            raw_next = "/"
-        next_path = _safe_next_path(raw_next)
-        # XSS hardening — echo back into a JS string literal AND an
-        # HTML attribute.
-        #
-        # ``json.dumps`` alone is NOT sufficient for embedding into
-        # an inline ``<script>`` block: it does not escape ``<`` or
-        # ``/``, so an input like ``</script><script>alert(1)`` would
-        # close our script tag and execute attacker JS.  The standard
-        # mitigation is to additionally escape ``<`` to its JS-string
-        # unicode form ``\u003c`` (and ``>`` to ``\u003e`` for good
-        # measure, in case a future browser parser uses it as a
-        # script-tag delimiter).  ``\u`` escapes are inert inside JS
-        # string literals — they decode at parse time but do not
-        # break out of the surrounding quote.
-        next_path_js = (
-            json.dumps(next_path)
-            .replace("<", "\\u003c")
-            .replace(">", "\\u003e")
-        )
-        # ``html.escape(..., quote=True)`` escapes ``"`` and ``'``
-        # within the value, which is what we need given the
-        # surrounding ``href="..."`` quotes.
-        next_path_attr = html.escape(next_path, quote=True)
-
-        body = f"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Signing you in…</title>
-<style>
-  body {{ font-family: system-ui, sans-serif; padding: 2rem; max-width: 40rem; margin: 0 auto; }}
-  .spinner {{ display: inline-block; width: 1.2em; height: 1.2em; border: 2px solid #999; border-top-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: middle; margin-right: 0.5em; }}
-  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
-  .err {{ color: #b00; }}
-  code {{ background: #f4f4f4; padding: 0.1em 0.3em; border-radius: 3px; }}
-</style>
-</head>
-<body>
-<p><span class="spinner"></span><span id="msg">Signing you in…</span></p>
-<noscript>
-  <p class="err">JavaScript is required to sign in to PeerTube via OpenHost SSO.
-     <a href="{next_path_attr}">Continue without signing in.</a></p>
-</noscript>
-<script>
-(function () {{
-  var nextUrl = {next_path_js};
-  var msg = document.getElementById('msg');
-  function showError(text) {{
-    msg.textContent = text;
-    msg.classList.add('err');
-  }}
-  function bounce() {{
-    // Use replace() so the browser back-button doesn't loop us
-    // through the trampoline a second time.
-    window.location.replace(nextUrl);
-  }}
-  // Mint a fresh PeerTube OAuth token by asking the sidecar.
-  fetch({json.dumps(SSO_TOKEN_PATH)}, {{
-    credentials: 'include',
-    cache: 'no-store',
-    headers: {{ 'Accept': 'application/json' }}
-  }}).then(function (resp) {{
-    if (!resp.ok) {{
-      // 401 → not the owner.  Fall through anonymously.
-      // 5xx → sidecar/PeerTube hiccup; show error but still let
-      //       the user click through.
-      if (resp.status === 401) {{
-        showError('Not signed into the OpenHost zone.');
-      }} else {{
-        showError('Sign-in failed (HTTP ' + resp.status + '). Continuing anonymously…');
-      }}
-      setTimeout(bounce, 1500);
-      throw new Error('mint-token failed: ' + resp.status);
-    }}
-    return resp.json();
-  }}).then(function (tokens) {{
-    try {{
-      // Match the exact localStorage keys PeerTube's SPA reads.
-      // The SPA's bootstrap (``loadUser`` in main.js) needs BOTH
-      // the OAuth token triple AND the four user-identity fields
-      // (id, username, email, role) — if any are missing the
-      // visitor is treated as anonymous on next render.  See
-      // /app/client/src/root-helpers/users/oauth-user-tokens.ts
-      // and user-local-storage-keys.ts in the upstream tree.
-      window.localStorage.setItem('access_token', tokens.access_token);
-      window.localStorage.setItem('refresh_token', tokens.refresh_token);
-      window.localStorage.setItem('token_type', tokens.token_type || 'Bearer');
-      // ``role`` is stored as the role-ID integer, stringified —
-      // the SPA's getLoggedInUser does parseInt(stored, 10).
-      // ``id`` is stored the same way.  Mismatching the stringify
-      // (e.g. storing the role *label* rather than the integer ID)
-      // makes the SPA think the user has the "Unknown" role and
-      // hides admin UI.
-      window.localStorage.setItem('id', String(tokens.user.id));
-      window.localStorage.setItem('username', tokens.user.username);
-      window.localStorage.setItem('email', tokens.user.email);
-      window.localStorage.setItem('role', String(tokens.user.role_id));
-    }} catch (e) {{
-      showError('Could not write OAuth token to localStorage. ' +
-                'Private-mode browsing? Continuing anonymously…');
-      setTimeout(bounce, 2000);
-      return;
-    }}
-    bounce();
-  }}).catch(function (err) {{
-    // Any other error (network down, JSON parse failure):
-    // log and bounce anonymously.  The bounce-target is the
-    // standard PeerTube login page on /login from the SPA's
-    // perspective, which still works as a fallback.
-    if (msg && !msg.classList.contains('err')) {{
-      showError('Sign-in failed: ' + err);
-      setTimeout(bounce, 2000);
-    }}
-  }});
-}})();
-</script>
-</body>
-</html>
-"""
-        body_bytes = body.encode("utf-8")
-        try:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body_bytes)))
-            self.send_header("Cache-Control", "no-store, max-age=0")
-            self.send_header("X-Content-Type-Options", "nosniff")
-            # Don't let the trampoline page be embedded.
-            self.send_header("X-Frame-Options", "DENY")
-            self.send_header("Connection", "close")
-            self.end_headers()
-            if self.command != "HEAD":
-                self.wfile.write(body_bytes)
-        except OSError as exc:
-            log.debug("client disconnected mid-SSO page: %s", exc)
-
-    def _handle_sso_mint_token(self) -> None:
-        """Internal endpoint that mints a PeerTube token for the owner.
-
-        Returns JSON
-        ``{access_token, refresh_token, token_type, expires_in,
-           user: {id, username, email, role_id}}`` on success.  The
-        ``user`` block is what the trampoline JS writes to
-        localStorage so the SPA's bootstrap recognises the visitor
-        as logged in (without it the SPA boots anonymous even with
-        valid tokens).  The identity fields come from
-        ``/api/v1/users/me`` called with the freshly-minted token.
-
-        Returns 401 if the request doesn't carry a valid owner
-        zone_auth.  Returns 5xx if PeerTube is unreachable, rejects
-        our credentials, or returns a malformed /users/me response.
-
-        Authorisation here is the zone_auth JWT verified inside
-        this method via ``_verify_owner``.  ``_dispatch`` routes
-        the path here directly (it dispatches by URL prefix BEFORE
-        the cookie inspection logic that drives the owner
-        trampoline redirect), so this method's own JWT check is
-        the SOLE enforcement — not a defence in depth.  Any change
-        that loosens it must be paired with a stronger check at
-        the dispatch layer.
-        """
-        # GET (page-load) and HEAD (occasional probe) are the only
-        # methods that make sense on this endpoint.  Anything else
-        # is a misuse and gets a clean 405 instead of being passed
-        # through.
-        if self.command not in ("GET", "HEAD"):
-            self._safe_send_error(405, "Method Not Allowed")
-            return
-
-        if self.jwks is None or self.oauth_bridge is None:
-            log.error("SSO mint-token reached without configured handlers")
-            self._safe_send_error(503, "SSO not initialised")
-            return
-
-        cookies = _parse_cookie_header(self.headers.get("Cookie"))
-        zone_token = cookies.get(ZONE_COOKIE, "")
-        if not _verify_owner(zone_token, self.jwks):
-            # Not the owner (or zone_auth absent).  401 is what the
-            # trampoline JS expects.
-            self._sso_json_response(401, {"error": "not_owner"})
-            return
-
-        # ``failure_until`` is the short-lived marker timestamp we
-        # apply on every error path so the browser doesn't loop the
-        # trampoline through a brief PeerTube outage.  Recomputed
-        # at use time in case mint_token blocks for a while.
-        def _failure_marker() -> int:
-            return int(time.time() + SSO_FAILURE_MARKER_SEC)
-
-        try:
-            tokens = self.oauth_bridge.mint_token()
-        except Exception as exc:  # noqa: BLE001
-            log.warning("PeerTube token mint failed: %s", exc)
-            self._sso_json_response(
-                502,
-                {"error": "mint_failed"},
-                marker_until=_failure_marker(),
-            )
-            return
-
-        # PeerTube always returns a JSON object on 200, but a buggy
-        # or compromised upstream COULD return a list / null /
-        # string.  Guard so the token-shape check below doesn't
-        # raise TypeError.
-        if not isinstance(tokens, dict):
-            log.warning(
-                "PeerTube token response is not a JSON object (got %s)",
-                type(tokens).__name__,
-            )
-            self._sso_json_response(
-                502,
-                {"error": "mint_malformed"},
-                marker_until=_failure_marker(),
-            )
-            return
-
-        # Minimal sanity-check.  PeerTube always returns these keys
-        # on success; if they're missing something is severely
-        # wrong.  Set the failure marker on this path too so the
-        # browser doesn't loop through the trampoline (the
-        # malformed-response case is one PeerTube doesn't recover
-        # from on its own — operator intervention needed).
-        for k in ("access_token", "refresh_token", "token_type"):
-            if k not in tokens:
-                log.warning("PeerTube token response missing %s", k)
-                self._sso_json_response(
-                    502,
-                    {"error": "mint_malformed"},
-                    marker_until=_failure_marker(),
-                )
-                return
-
-        # Compute the marker-cookie expiry.  The marker MUST expire
-        # before the access token does — otherwise an owner whose
-        # marker is still valid when their token has expired will
-        # skip the trampoline and the SPA's localStorage tokens are
-        # stale.  We bake in SSO_MARKER_SAFETY_MARGIN_SEC of
-        # headroom: marker_until = now + expires_in - margin.  For
-        # the typical 24h PeerTube token, the marker lasts 23h.
-        #
-        # Use an explicit ``is None`` check so a legitimate
-        # ``expires_in: 0`` (which would be a degenerate but valid
-        # PeerTube response) is detected and handled — the
-        # falsy-or idiom would silently substitute the 86400
-        # default for any zero/empty value, masking the issue.
-        raw_expires = tokens.get("expires_in")
-        try:
-            expires_in = int(raw_expires) if raw_expires is not None else 86400
-        except (TypeError, ValueError):
-            log.warning(
-                "PeerTube returned non-numeric expires_in=%r; using default 24h",
-                raw_expires,
-            )
-            expires_in = 86400
-        if expires_in <= 0:
-            log.warning(
-                "PeerTube returned non-positive expires_in=%d; "
-                "marker cookie will use a 60s floor",
-                expires_in,
-            )
-        marker_lifetime = max(60, expires_in - SSO_MARKER_SAFETY_MARGIN_SEC)
-        marker_until = int(time.time() + marker_lifetime)
-
-        # Fetch user-identity fields (id/username/email/role) from
-        # /users/me so the trampoline can prime the SPA's
-        # localStorage with everything its bootstrap needs.  Without
-        # these the SPA boots as anonymous even with valid tokens:
-        # the bootstrap calls ``loadUser`` in the upstream
-        # ``main.ts``, which calls ``getLoggedInUser`` in
-        # ``client/src/root-helpers/users/user-local-storage-keys.ts``,
-        # which returns null (and skips ``buildAuthUser``) whenever
-        # the ``username`` localStorage key is absent.
-        try:
-            me = self.oauth_bridge.fetch_user_info(
-                access_token=tokens["access_token"],
-                token_type=tokens["token_type"],
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.warning("PeerTube /users/me fetch failed: %s", exc)
-            self._sso_json_response(
-                502,
-                {"error": "userinfo_failed"},
-                marker_until=_failure_marker(),
-            )
-            return
-
-        # Extract the four required identity fields with defensive
-        # guards so a buggy/compromised upstream doesn't take down
-        # the trampoline with a TypeError.  All four are required
-        # by the SPA's ``getLoggedInUser`` reader; if any is missing
-        # we fail closed.
-        try:
-            user_id = int(me["id"])
-            username = str(me["username"])
-            email = str(me["email"])
-            role_obj = me.get("role")
-            if not isinstance(role_obj, dict) or "id" not in role_obj:
-                raise KeyError("role.id")
-            role_id = int(role_obj["id"])
-        except (KeyError, TypeError, ValueError) as exc:
-            log.warning(
-                "PeerTube /users/me missing/malformed identity fields: %s",
-                exc,
-            )
-            self._sso_json_response(
-                502,
-                {"error": "userinfo_malformed"},
-                marker_until=_failure_marker(),
-            )
-            return
-
-        # Send the success response through ``_sso_json_response``
-        # so HEAD handling, Content-Length, CRLF-injection-proof
-        # marker-cookie construction, and OSError robustness all
-        # share one code path with the failure responses above.
-        self._sso_json_response(
-            200,
-            {
-                "access_token": tokens["access_token"],
-                "refresh_token": tokens["refresh_token"],
-                "token_type": tokens["token_type"],
-                "expires_in": expires_in,
-                "user": {
-                    "id": user_id,
-                    "username": username,
-                    "email": email,
-                    "role_id": role_id,
-                },
-            },
-            marker_until=marker_until,
-        )
-
-    def _handle_sso_logout(self) -> None:
-        """Clears the marker cookie so the next visit re-trampolines.
-
-        Doesn't actually revoke the PeerTube OAuth token (PeerTube
-        has its own /api/v1/users/revoke-token for that, which the
-        SPA already calls during its logout flow).  All we need to
-        do here is wipe the marker so the sidecar will re-trigger
-        the trampoline on the next owner visit, which in turn will
-        replace the stale localStorage tokens.
-
-        Anti-CSRF: we require POST AND a custom header
-        ``X-Requested-With: XMLHttpRequest``.  POST alone isn't
-        enough — a cross-site ``<form method="POST">`` submission
-        IS allowed by SameSite=Lax (Lax blocks cross-site requests
-        that aren't top-level navigations, but a top-level form
-        POST IS a top-level navigation).  Requiring a custom
-        header IS sufficient: HTML forms cannot set arbitrary
-        request headers, only the same Content-Type values a form
-        already supports.  ``XMLHttpRequest`` / ``fetch()`` from
-        same-origin JS can set the custom header without
-        triggering a CORS preflight (because the header value
-        ``XMLHttpRequest`` is on the CORS-safelisted-request-header
-        list under "X-Requested-With").
-        """
-        if self.command not in ("POST",):
-            self._safe_send_error(405, "Method Not Allowed")
-            return
-        xrw = self.headers.get("X-Requested-With", "").strip().lower()
-        if xrw != "xmlhttprequest":
-            log.info(
-                "rejecting /__openhost-sso/logout without X-Requested-With"
-            )
-            self._safe_send_error(403, "X-Requested-With header required")
-            return
-        # ``_build_marker_cookie`` already gates ``Secure`` on
-        # ``X-Forwarded-Proto`` so the unset Set-Cookie addresses
-        # the same cookie scope as the original.  A mismatched
-        # attribute set can leave the browser holding onto the
-        # original cookie because it treats the unset as a
-        # different cookie.  Pass marker_until=0 so the value and
-        # Max-Age both expire immediately.
-        unset_cookie = self._build_marker_cookie(0)
-        try:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", "0")
-            self.send_header("Set-Cookie", unset_cookie)
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Connection", "close")
-            self.end_headers()
-        except OSError as exc:
-            log.debug("client disconnected mid-SSO logout: %s", exc)
-
-    def _sso_json_response(
-        self,
-        code: int,
-        body: dict,
-        marker_until: int | None = None,
-    ) -> None:
-        """Send a JSON response from a sidecar SSO endpoint.
-
-        Honours HEAD per RFC 9110 §9.3.2 by skipping the body write
-        but keeping the Content-Length so the client knows the size
-        a GET would have returned.
-
-        ``marker_until`` optionally sets the SSO marker cookie to
-        the given unix timestamp.  Used by the mint-failure path to
-        prevent a redirect loop when PeerTube is briefly unavailable.
-        """
-        body_bytes = json.dumps(body).encode("utf-8")
-        try:
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body_bytes)))
-            self.send_header("Cache-Control", "no-store, max-age=0")
-            if marker_until is not None:
-                self.send_header(
-                    "Set-Cookie",
-                    self._build_marker_cookie(marker_until),
-                )
-            self.send_header("Connection", "close")
-            self.end_headers()
-            if self.command != "HEAD":
-                self.wfile.write(body_bytes)
-        except OSError as exc:
-            log.debug("client disconnected mid-SSO error response: %s", exc)
+            log.debug("client disconnected during SSO bounce: %s", exc)
 
     def _build_marker_cookie(self, marker_until: int) -> str:
         """Build the marker-cookie ``Set-Cookie`` header value.
 
-        Centralises the cookie-attribute construction so the mint,
-        logout, and failure paths all stay in sync.  ``Secure`` is
-        added only on HTTPS — see the inline comment in
-        ``_handle_sso_mint_token`` for why.
+        ``Secure`` is added only on HTTPS — set based on the
+        ``X-Forwarded-Proto`` header the OpenHost router stamps.
+        We can't unconditionally set ``Secure`` because the
+        development OpenHost router serves zones over plain HTTP
+        on lvh.me / localhost, and the browser would silently
+        drop a ``Secure`` cookie on a plain-HTTP page.
 
         ``X-Forwarded-Proto`` parsing is strict: we split on commas
         (multi-hop proxies prepend additional values) and check
@@ -2108,41 +1407,6 @@ def _port_from_env(name: str, default: int) -> int:
     return port
 
 
-def _read_admin_password(path: str) -> str:
-    """Read the trimmed root admin password from ``admin-password.txt``.
-
-    Same recipe as start.sh's gen_secret reader: read the first line,
-    strip surrounding whitespace, fail loud if it ends up empty.
-    Without this credential we have no way to mint OAuth tokens for
-    the owner — that's a hard fail rather than a runtime degraded
-    state.
-
-    Decoding uses ``errors="strict"`` so a non-UTF-8 byte in the
-    file (corrupted save / wrong file pointed at) fails immediately
-    with a clear UnicodeDecodeError instead of silently substituting
-    U+FFFD into the password and producing every PeerTube auth as
-    a 401 with no obvious cause.
-    """
-    try:
-        with open(path, "rb") as f:
-            first_line = f.readline()
-    except OSError as exc:
-        raise RuntimeError(
-            f"cannot read admin password from {path}: {exc}"
-        ) from exc
-    try:
-        pw = first_line.decode("utf-8", errors="strict").strip()
-    except UnicodeDecodeError as exc:
-        raise RuntimeError(
-            f"admin password file {path} is not valid UTF-8: {exc}"
-        ) from exc
-    if not pw:
-        raise RuntimeError(
-            f"admin password file {path} is empty/whitespace-only"
-        )
-    return pw
-
-
 def main() -> int:
     router_url = os.environ.get("OPENHOST_ROUTER_URL", "").strip()
     if not router_url:
@@ -2152,18 +1416,9 @@ def main() -> int:
     try:
         listen_port = _port_from_env("AUTH_PROXY_LISTEN_PORT", 9000)
         # AUTH_PROXY_UPSTREAM_PORT is the port Caddy listens on (Caddy
-        # is the Host-rewriter that fronts PeerTube).  Pass-through
-        # proxy traffic flows AUTH_PROXY → Caddy → PeerTube.
+        # is the Host-rewriter that fronts PeerTube).  All
+        # pass-through traffic flows AUTH_PROXY → Caddy → PeerTube.
         upstream_port = _port_from_env("AUTH_PROXY_UPSTREAM_PORT", 9090)
-        # AUTH_PROXY_PEERTUBE_PORT is where PeerTube itself listens
-        # on the loopback.  The OAuth bridge bypasses Caddy and
-        # speaks to PeerTube directly because PeerTube's
-        # /api/v1/oauth-clients/local handler enforces a strict
-        # Host-header equality check that's awkward to satisfy
-        # through the Caddy mid-tier when there's no inbound
-        # X-Forwarded-Host to rewrite from (loopback callers don't
-        # have one).
-        peertube_port = _port_from_env("AUTH_PROXY_PEERTUBE_PORT", 9001)
     except ValueError as exc:
         log.error("invalid port configuration: %s", exc)
         return 1
@@ -2171,59 +1426,13 @@ def main() -> int:
     upstream_host = os.environ.get(
         "AUTH_PROXY_UPSTREAM_HOST", "127.0.0.1"
     ).strip() or "127.0.0.1"
-    peertube_host = os.environ.get(
-        "AUTH_PROXY_PEERTUBE_HOST", "127.0.0.1"
-    ).strip() or "127.0.0.1"
-
-    # The canonical PeerTube hostname (and explicit :port if the
-    # public URL has a non-standard one) — what PeerTube expects on
-    # the Host header when it's checking ``oauth-clients/local``.
-    # start.sh derives this from PEERTUBE_WEBSERVER_HOSTNAME +
-    # PEERTUBE_WEBSERVER_PORT and passes it via env.
-    canonical_host = os.environ.get(
-        "AUTH_PROXY_CANONICAL_HOST", ""
-    ).strip()
-    if not canonical_host:
-        log.error(
-            "AUTH_PROXY_CANONICAL_HOST is not set; refusing to start "
-            "(should be PEERTUBE_WEBSERVER_HOSTNAME[:port])"
-        )
-        return 1
-
-    admin_user = os.environ.get(
-        "AUTH_PROXY_ADMIN_USER", "root"
-    ).strip() or "root"
-
-    admin_pw_file = os.environ.get(
-        "AUTH_PROXY_ADMIN_PW_FILE", ""
-    ).strip()
-    if not admin_pw_file:
-        log.error(
-            "AUTH_PROXY_ADMIN_PW_FILE is not set; refusing to start "
-            "(point this at your admin-password.txt)"
-        )
-        return 1
-    try:
-        admin_pw = _read_admin_password(admin_pw_file)
-    except RuntimeError as exc:
-        log.error("admin password load failed: %s", exc)
-        return 1
 
     jwks = JwksCache(router_url)
     jwks.prefetch()
 
-    bridge = PeerTubeOauthBridge(
-        peertube_host=peertube_host,
-        peertube_port=peertube_port,
-        canonical_host=canonical_host,
-        username=admin_user,
-        password=admin_pw,
-    )
-
     AuthProxyHandler.jwks = jwks
     AuthProxyHandler.upstream_host = upstream_host
     AuthProxyHandler.upstream_port = upstream_port
-    AuthProxyHandler.oauth_bridge = bridge
 
     try:
         server = IPv4ThreadingServer(("0.0.0.0", listen_port), AuthProxyHandler)
@@ -2235,10 +1444,8 @@ def main() -> int:
         return 1
 
     log.info(
-        "listening on 0.0.0.0:%d -> %s:%d (router=%s, admin_user=%s, "
-        "canonical_host=%s, peertube=%s:%d)",
-        listen_port, upstream_host, upstream_port, router_url, admin_user,
-        canonical_host, peertube_host, peertube_port,
+        "listening on 0.0.0.0:%d -> %s:%d (router=%s, sso_bounce=%s)",
+        listen_port, upstream_host, upstream_port, router_url, SSO_BOUNCE_PATH,
     )
     try:
         server.serve_forever()
