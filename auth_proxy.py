@@ -1,7 +1,11 @@
 """OpenHost auth-sidecar for PeerTube — owner SSO without breaking federation.
 
-Two rails, mirroring the openhost-nextcloud pattern but adapted to
-PeerTube's localStorage-based OAuth2 client:
+Two rails for traffic flow, plus three sidecar-served endpoints
+under ``/__openhost-sso/*`` (``login``, ``mint-token``, ``logout``)
+that drive the SSO bridge.  The two traffic rails mirror the
+openhost-nextcloud pattern but the SSO endpoints are
+PeerTube-specific because PeerTube's SPA reads its OAuth2 token
+from ``localStorage`` rather than a cookie.
 
 1. Anonymous + federation (the default).  Almost every URL on a
    PeerTube instance is reachable without login: a remote Mastodon
@@ -33,6 +37,14 @@ PeerTube's localStorage-based OAuth2 client:
    so the sidecar passes the request through untouched and the SPA
    reads the still-valid token from localStorage on its own.
 
+   ``/__openhost-sso/logout`` (POST-only — see the handler) clears
+   the marker cookie so the next owner visit re-trampolines and
+   replaces stale localStorage tokens.  Useful after the operator
+   resets the admin password (the sidecar caches the password at
+   startup, so a reset requires a container restart anyway, but
+   the logout endpoint at least stops the browser from holding
+   onto the stale OAuth tokens after the marker invalidates).
+
 The trampoline is the SPA-friendly equivalent of nextcloud's
 header-stamping SSO.  PeerTube stores its OAuth token in
 ``localStorage`` (not a cookie) so we have no choice but to bridge
@@ -56,10 +68,18 @@ anonymous PeerTube experience.
 
 Header sanitation: client-supplied ``X-OpenHost-User`` and
 ``X-OpenHost-Is-Owner`` headers are stripped on every request
-(including federation paths and the trampoline endpoints),
-matching the openhost-nextcloud defence.  These are the headers
-the OpenHost router uses to assert owner identity to the app;
-forging them must never grant privilege.
+that the sidecar PROXIES UPSTREAM — i.e., everything that
+reaches ``_proxy()`` or ``_proxy_websocket()``, which covers
+both federation paths and the owner pass-through after the
+trampoline.  These are the headers the OpenHost router uses to
+assert owner identity to the app; forging them must never
+grant privilege downstream.
+
+The three sidecar-served SSO endpoints (``/__openhost-sso/login``,
+``/.../mint-token``, ``/.../logout``) do NOT proxy upstream and
+therefore don't run the strip step — but they also never use
+the trust headers for any decision.  Owner authentication on
+those paths is exclusively the JWT signature check.
 
 We do NOT strip ``Authorization``: the SPA, mobile app, and any
 third-party PeerTube client carries its OAuth2 access token in
@@ -1093,28 +1113,20 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
         marker_lifetime = max(60, expires_in - SSO_MARKER_SAFETY_MARGIN_SEC)
         marker_until = int(time.time() + marker_lifetime)
 
-        # Build the marker cookie.  Attributes documented in
-        # ``_build_marker_cookie``.
-        cookie_value = self._build_marker_cookie(marker_until)
-
-        body_bytes = json.dumps({
-            "access_token": tokens["access_token"],
-            "refresh_token": tokens["refresh_token"],
-            "token_type": tokens["token_type"],
-            "expires_in": expires_in,
-        }).encode("utf-8")
-        try:
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body_bytes)))
-            self.send_header("Cache-Control", "no-store, max-age=0")
-            self.send_header("Set-Cookie", cookie_value)
-            self.send_header("Connection", "close")
-            self.end_headers()
-            if self.command != "HEAD":
-                self.wfile.write(body_bytes)
-        except OSError as exc:
-            log.debug("client disconnected mid-SSO mint: %s", exc)
+        # Send the success response through ``_sso_json_response``
+        # so HEAD handling, Content-Length, CRLF-injection-proof
+        # marker-cookie construction, and OSError robustness all
+        # share one code path with the failure responses above.
+        self._sso_json_response(
+            200,
+            {
+                "access_token": tokens["access_token"],
+                "refresh_token": tokens["refresh_token"],
+                "token_type": tokens["token_type"],
+                "expires_in": expires_in,
+            },
+            marker_until=marker_until,
+        )
 
     def _handle_sso_logout(self) -> None:
         """Clears the marker cookie so the next visit re-trampolines.
@@ -1198,9 +1210,18 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
         logout, and failure paths all stay in sync.  ``Secure`` is
         added only on HTTPS — see the inline comment in
         ``_handle_sso_mint_token`` for why.
+
+        ``X-Forwarded-Proto`` parsing is strict: we split on commas
+        (multi-hop proxies prepend additional values) and check
+        whether ANY token is exactly ``https``.  A naive substring
+        check would mis-classify a value like ``nothttps`` or
+        ``https-variant`` as HTTPS.
         """
         xfp = self.headers.get("X-Forwarded-Proto", "").lower()
-        is_https = "https" in xfp
+        # Tokens are comma-separated per RFC 7239; whitespace-tolerant.
+        is_https = any(
+            tok.strip() == "https" for tok in xfp.split(",")
+        )
         max_age = max(0, marker_until - int(time.time()))
         attrs = [
             f"{SSO_MARKER_COOKIE}={marker_until}",

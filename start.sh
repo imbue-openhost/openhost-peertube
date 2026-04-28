@@ -496,10 +496,15 @@ export PEERTUBE_REDIS_AUTH="$REDIS_PASSWORD"
 LOCAL_CONFIG_DIR=/config
 mkdir -p "$LOCAL_CONFIG_DIR"
 chown peertube:peertube "$LOCAL_CONFIG_DIR"
-cat > "$LOCAL_CONFIG_DIR/local.yaml" <<'EOF'
+# Heredoc unquoted (``EOF`` not ``'EOF'``) so $PEERTUBE_PORT
+# expands.  Keeps PeerTube's listen config in sync with the
+# rest of the stack — if the port ever changes, all five
+# layers (this file, Caddy, the auth-proxy, the readiness
+# probe, the supervisor) pick up the new value together.
+cat > "$LOCAL_CONFIG_DIR/local.yaml" <<EOF
 listen:
   hostname: 127.0.0.1
-  port: 9001
+  port: $PEERTUBE_PORT
 EOF
 chown peertube:peertube "$LOCAL_CONFIG_DIR/local.yaml"
 chmod 644 "$LOCAL_CONFIG_DIR/local.yaml"
