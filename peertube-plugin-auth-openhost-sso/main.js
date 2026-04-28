@@ -591,29 +591,20 @@ async function getCandidateSigningKeys (jwks, kid) {
     })]
   }
   // No kid: pull the full JWKS and return all keys.  jwks-rsa
-  // exposes ``getKeys`` which returns the full list (this is
-  // the same call ``getSigningKey`` uses internally when the
-  // requested kid is absent from the cache).
-  const keys = await new Promise((resolve, reject) => {
-    jwks.getKeys((err, fetched) => {
-      if (err) return reject(err)
-      resolve(fetched)
-    })
-  })
-  if (!Array.isArray(keys)) return []
-  return keys
+  // 3.x's ``getKeys()`` is a Promise-returning async method
+  // (it doesn't take a callback), so we await directly.  It
+  // returns the raw JWK objects PeerTube's router exposes
+  // under the ``keys`` array.
+  let rawKeys
+  try {
+    rawKeys = await jwks.getKeys()
+  } catch (err) {
+    throw new Error('JWKS fetch failed: ' + err.message)
+  }
+  if (!Array.isArray(rawKeys)) return []
+  return rawKeys
     .filter(k => k && k.kty === 'RSA')
-    .map(k => {
-      // jwks-rsa returns "raw" JWK objects from getKeys (not
-      // the SigningKey wrapper getSigningKey returns).  We
-      // need to convert each to PEM ourselves.  Use the same
-      // helpers jwks-rsa uses internally — they're exposed on
-      // the module for exactly this purpose.
-      const { JwksClient } = require('jwks-rsa')
-      // Reuse one shared converter so we don't pay the
-      // module-resolution cost on every key.
-      return jwksRsaJwkToPem(k)
-    })
+    .map(k => jwksRsaJwkToPem(k))
 }
 
 // Lazy import of the jwk-to-pem helper so a future jwks-rsa
