@@ -707,36 +707,37 @@ fi
 # writes it to localStorage so the SPA picks it up.  See
 # auth_proxy.py module docstring for the full design.
 #
-# Runs as `nobody` because it doesn't need any persistent state
-# of its own (the JWKS cache and OAuth client_id/secret cache are
-# in-memory; the admin password is read once at startup from
-# $ADMIN_PW_FILE).  It DOES need read access to the password
-# file, which is owned by root with mode 0600 — we briefly
-# expose it to nobody by making the parent secrets dir traversable
-# and setting the file mode to 0640 with group nobody.  This is
-# tighter than world-readable and gives the sidecar exactly what
-# it needs.
+# Runs as a dedicated ``openhost-authproxy`` user (not ``nobody``).
+# This is least-privilege: the auth-proxy holds the PeerTube
+# admin credential, so it must NOT share an identity with any
+# other long-lived process in the container.  Caddy (also
+# loopback-only) runs as ``nobody`` — if we used ``nobody`` for
+# the auth-proxy too, a Caddy RCE would yield read access to the
+# admin password.  The dedicated user means a Caddy compromise
+# cannot read /data/app_data/peertube/admin-password.txt.
 #
-# Why not run as the same user as Caddy (which we also use as
-# `nobody`)?  Because we want to be able to swap user identity
-# in the future without coupling the two.  The cost of two
-# nobody processes is just two entries in /proc.
+# The user has no shell, no home dir, no membership in any
+# group besides its own.  See the Dockerfile for the
+# groupadd / useradd that creates it.
 
-# Make the admin-password file readable by the auth-proxy.  The
-# file is created by gen_secret() above with mode 0600 owned by
-# root.  We chgrp it to `nogroup` (the primary group of the
-# `nobody` user on Debian) and chmod 640 — root can still
-# write, the auth-proxy can read, the rest of the world cannot.
-chown root:nogroup "$ADMIN_PW_FILE"
+# Make the admin-password file readable by the auth-proxy alone.
+# The file is created by gen_secret() above with mode 0600 owned
+# by root.  We chgrp it to ``openhost-authproxy`` (the dedicated
+# group the Dockerfile creates for the sidecar) and chmod 640 —
+# root can still write, the auth-proxy process (which runs as
+# ``openhost-authproxy``) can read, every other process in the
+# container — including Caddy running as ``nobody`` — gets
+# nothing.  This is least-privilege: even a Caddy RCE can't
+# steal the PeerTube admin credential.
+chown root:openhost-authproxy "$ADMIN_PW_FILE"
 chmod 640 "$ADMIN_PW_FILE"
-# The secrets dir starts as 0700 root:root.  We need `nobody` to
-# be able to traverse it (open the file by path), so we chgrp the
-# dir to `nogroup` and set mode 0710 — root has full access,
-# `nogroup` members can traverse + look up entries by name (but
-# not list the directory contents), and everyone else gets nothing.
-# This is tighter than 0711 (which grants traverse to all users
-# on the system) while still letting `nobody` open the file.
-chown root:nogroup "$SECRETS_DIR"
+# The secrets dir starts as 0700 root:root.  We need the
+# auth-proxy user to be able to traverse it (open the file by
+# path), so we chgrp the dir to ``openhost-authproxy`` and set
+# mode 0710 — root has full access, group members can traverse
+# + look up entries by name (but not list the directory
+# contents), and everyone else gets nothing.
+chown root:openhost-authproxy "$SECRETS_DIR"
 chmod 710 "$SECRETS_DIR"
 
 # Construct the canonical Host header value PeerTube enforces on
@@ -781,7 +782,7 @@ AUTH_PROXY_CANONICAL_HOST="$CANONICAL_HOST" \
 AUTH_PROXY_ADMIN_USER="root" \
 AUTH_PROXY_ADMIN_PW_FILE="$ADMIN_PW_FILE" \
 OPENHOST_ROUTER_URL="$OPENHOST_ROUTER_URL" \
-    runuser -u nobody --preserve-environment -- \
+    runuser -u openhost-authproxy --preserve-environment -- \
         python3 /opt/openhost-peertube/auth_proxy.py &
 AUTH_PROXY_PID=$!
 

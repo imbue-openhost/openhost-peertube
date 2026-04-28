@@ -95,9 +95,12 @@ all owned by the same login.
 #### Threat model / sanity-check
 
 * The auth-proxy unconditionally strips `X-OpenHost-User` and
-  `X-OpenHost-Is-Owner` from inbound requests on every path.
-  Owner identity is determined exclusively by the JWT signature,
-  not by client-supplied headers.
+  `X-OpenHost-Is-Owner` from inbound requests on every PROXIED
+  path (i.e. everything except the three sidecar-served
+  `/__openhost-sso/*` endpoints, which never use those headers
+  for any decision anyway). Owner identity is determined
+  exclusively by the JWT signature, not by client-supplied
+  headers.
 * The `/__openhost-sso/mint-token` endpoint is the only place the
   PeerTube admin password leaves the sidecar process, and it
   reaches only loopback. Without a valid owner JWT the endpoint

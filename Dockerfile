@@ -63,6 +63,18 @@ RUN apt-get update \
         python3-cryptography \
  && rm -rf /var/lib/apt/lists/*
 
+# Dedicated unprivileged user/group for the auth-proxy sidecar.
+# We don't share the ``nobody`` user with Caddy because Caddy is
+# also long-lived in this container and we want the auth-proxy's
+# admin-password.txt to be readable ONLY by the auth-proxy
+# process — not by every other "running as nobody" process.
+# A dedicated user keeps the principle of least privilege: even
+# if Caddy gets a remote-code execution bug, it can't read the
+# PeerTube admin credential.
+RUN groupadd --system openhost-authproxy \
+ && useradd --system --no-create-home --shell /usr/sbin/nologin \
+        --gid openhost-authproxy openhost-authproxy
+
 # Postgres' Debian package ships a "main" cluster auto-created at
 # install time under /var/lib/postgresql/15/main. We don't want
 # that — our start script initdb's a fresh cluster under
