@@ -66,7 +66,6 @@ SECRETS_DIR="$PERSIST/secrets"
 #     PeerTube     :9001   ── loopback, the actual node app
 AUTH_PROXY_LISTEN_PORT=9000
 CADDY_PORT=9090
-PEERTUBE_PORT=9001
 
 mkdir -p "$PERSIST" "$TEMP" \
          "$PEERTUBE_DATA_DIR" \
@@ -496,15 +495,10 @@ export PEERTUBE_REDIS_AUTH="$REDIS_PASSWORD"
 LOCAL_CONFIG_DIR=/config
 mkdir -p "$LOCAL_CONFIG_DIR"
 chown peertube:peertube "$LOCAL_CONFIG_DIR"
-# Heredoc unquoted (``EOF`` not ``'EOF'``) so $PEERTUBE_PORT
-# expands.  Keeps PeerTube's listen config in sync with the
-# rest of the stack — if the port ever changes, all five
-# layers (this file, Caddy, the auth-proxy, the readiness
-# probe, the supervisor) pick up the new value together.
-cat > "$LOCAL_CONFIG_DIR/local.yaml" <<EOF
+cat > "$LOCAL_CONFIG_DIR/local.yaml" <<'EOF'
 listen:
   hostname: 127.0.0.1
-  port: $PEERTUBE_PORT
+  port: 9001
 EOF
 chown peertube:peertube "$LOCAL_CONFIG_DIR/local.yaml"
 chmod 644 "$LOCAL_CONFIG_DIR/local.yaml"
@@ -602,7 +596,7 @@ chown -R peertube:peertube \
 # We pass --max-old-space-size to give node enough heap for video
 # upload buffering; PeerTube's own docs recommend 1500 MiB on a
 # 2 GiB host.
-log "Starting PeerTube on $PT_HOSTNAME (loopback :${PEERTUBE_PORT})"
+log "Starting PeerTube on $PT_HOSTNAME (loopback :9001)"
 cd /app
 gosu peertube node --max-old-space-size=1500 dist/server &
 PEERTUBE_PID=$!
@@ -614,7 +608,7 @@ PEERTUBE_PID=$!
 # sees 502s and may give up before PeerTube has finished
 # its initial DB migrate + Sequelize sync (which can take
 # 30-60s on first boot).
-log "Waiting for PeerTube to listen on 127.0.0.1:${PEERTUBE_PORT}"
+log "Waiting for PeerTube to listen on 127.0.0.1:9001"
 PT_READY=0
 for _ in $(seq 1 120); do
     if ! kill -0 "$PEERTUBE_PID" 2>/dev/null; then
@@ -625,14 +619,14 @@ for _ in $(seq 1 120); do
     # /dev/tcp is a bash builtin: opens a TCP probe and exits 0
     # if the connect handshake completes. Avoids depending on
     # `nc` which isn't always installed.
-    if (echo > /dev/tcp/127.0.0.1/$PEERTUBE_PORT) 2>/dev/null; then
+    if (echo > /dev/tcp/127.0.0.1/9001) 2>/dev/null; then
         PT_READY=1
         break
     fi
     sleep 1
 done
 if [[ "$PT_READY" -ne 1 ]]; then
-    log "FATAL: PeerTube didn't bind 127.0.0.1:${PEERTUBE_PORT} within 120s"
+    log "FATAL: PeerTube didn't bind 127.0.0.1:9001 within 120s"
     early_exit_teardown
     exit 1
 fi
@@ -653,7 +647,7 @@ log "PeerTube is listening; bringing up Caddy"
 # yet another running-as-root daemon. The bookworm package ships
 # a `caddy` system user we could use, but `nobody` is universal
 # and Caddy doesn't need persistent state for this config.
-log "Starting Caddy host-rewriter on :${CADDY_PORT} -> :${PEERTUBE_PORT}"
+log "Starting Caddy host-rewriter on :${CADDY_PORT} -> :9001"
 # Caddy uses XDG_CONFIG_HOME / XDG_DATA_HOME to find a writable
 # directory for autosave state. Under `runuser -u nobody` the
 # default points at /nonexistent which (correctly) doesn't
@@ -671,27 +665,12 @@ XDG_CONFIG_HOME="$CADDY_HOME" XDG_DATA_HOME="$CADDY_HOME" \
 CADDY_PID=$!
 
 # Caddy startup is fast (~100ms) but give it a moment to bind
-# the port before we put the auth-proxy in front of it. Bail
-# loudly if Caddy never came up — without it the whole stack is
-# unreachable.  We poll the listening port (rather than just
-# checking ``kill -0``) because Caddy can briefly stay alive but
-# fail to bind, e.g. on a port-already-in-use error from a
-# previous incomplete teardown.
-CADDY_READY=0
-for _ in $(seq 1 30); do
-    if ! kill -0 "$CADDY_PID" 2>/dev/null; then
-        log "FATAL: Caddy exited during startup"
-        early_exit_teardown
-        exit 1
-    fi
-    if (echo > /dev/tcp/127.0.0.1/$CADDY_PORT) 2>/dev/null; then
-        CADDY_READY=1
-        break
-    fi
-    sleep 0.5
-done
-if [[ "$CADDY_READY" -ne 1 ]]; then
-    log "FATAL: Caddy didn't bind 127.0.0.1:$CADDY_PORT in 15s"
+# the port before the OpenHost router's first health check.
+# Bail loudly if it never came up — without Caddy the whole
+# stack is unreachable.
+sleep 1
+if ! kill -0 "$CADDY_PID" 2>/dev/null; then
+    log "FATAL: Caddy exited before supervisor started"
     early_exit_teardown
     exit 1
 fi
@@ -777,7 +756,7 @@ AUTH_PROXY_LISTEN_PORT="$AUTH_PROXY_LISTEN_PORT" \
 AUTH_PROXY_UPSTREAM_HOST="127.0.0.1" \
 AUTH_PROXY_UPSTREAM_PORT="$CADDY_PORT" \
 AUTH_PROXY_PEERTUBE_HOST="127.0.0.1" \
-AUTH_PROXY_PEERTUBE_PORT="$PEERTUBE_PORT" \
+AUTH_PROXY_PEERTUBE_PORT="9001" \
 AUTH_PROXY_CANONICAL_HOST="$CANONICAL_HOST" \
 AUTH_PROXY_ADMIN_USER="root" \
 AUTH_PROXY_ADMIN_PW_FILE="$ADMIN_PW_FILE" \
