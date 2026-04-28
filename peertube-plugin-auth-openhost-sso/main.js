@@ -493,61 +493,144 @@ async function handleAuthRequest (req, res) {
 // JWT verification helper
 // ----------------------------------------------------------------
 
-function verifyOwnerJwt (token, jwks) {
-  return new Promise((resolve, reject) => {
-    let header
+async function verifyOwnerJwt (token, jwks) {
+  let header
+  try {
+    const decoded = jwt.decode(token, { complete: true })
+    if (!decoded || !decoded.header) {
+      throw new Error('malformed JWT (no header)')
+    }
+    header = decoded.header
+  } catch (err) {
+    throw new Error('JWT decode failed: ' + err.message)
+  }
+
+  // We only accept RS256 because the OpenHost router only
+  // signs RS256.  Pinning the algorithm at verify-time is the
+  // standard mitigation for the "alg=none" / "alg=HS256 with
+  // public key as secret" classes of JWT attacks.
+  if (header.alg !== 'RS256') {
+    throw new Error('unexpected JWT alg: ' + header.alg)
+  }
+
+  // Resolve candidate signing keys.  When the JWT carries a
+  // ``kid`` we can look the matching JWK up directly; when it
+  // doesn't (the OpenHost router's current ``jwt.encode`` call
+  // doesn't set ``kid`` on the header, and the ``/.well-known/
+  // jwks.json`` it publishes also has no ``kid`` field), we
+  // fall back to trying every key in the JWKS in turn — the
+  // same strategy auth_proxy.py uses on the Python side.  In
+  // practice the JWKS only ever has one key, so the fallback
+  // is a single verification attempt.
+  const candidates = await getCandidateSigningKeys(jwks, header.kid)
+  if (candidates.length === 0) {
+    throw new Error('JWKS has no signing keys')
+  }
+
+  let lastErr
+  for (const publicKey of candidates) {
+    let payload
     try {
-      const decoded = jwt.decode(token, { complete: true })
-      if (!decoded || !decoded.header) {
-        return reject(new Error('malformed JWT (no header)'))
-      }
-      header = decoded.header
+      payload = await new Promise((resolve, reject) => {
+        jwt.verify(
+          token,
+          publicKey,
+          {
+            algorithms: ['RS256'],
+            clockTolerance: JWT_CLOCK_TOLERANCE_SEC
+          },
+          (verr, p) => {
+            if (verr) return reject(verr)
+            resolve(p)
+          }
+        )
+      })
     } catch (err) {
-      return reject(new Error('JWT decode failed: ' + err.message))
+      lastErr = err
+      continue
     }
+    if (typeof payload !== 'object' || !payload) {
+      lastErr = new Error('JWT payload is not an object')
+      continue
+    }
+    // Reject tokens with no ``exp`` claim.  jsonwebtoken only
+    // enforces expiry when ``exp`` is present in the payload —
+    // a token that omits the claim entirely is accepted
+    // forever.  We require ``exp`` explicitly here so a
+    // router-issued token without an expiry can't grant
+    // indefinite admin access.  Matches what auth_proxy.py
+    // does (PyJWT's ``options={"require": ["exp"]}``) on the
+    // same JWT.
+    if (typeof payload.exp !== 'number') {
+      lastErr = new Error('JWT has no exp claim')
+      continue
+    }
+    return payload
+  }
+  throw new Error('JWT verify failed against all JWKS keys: ' + (lastErr && lastErr.message))
+}
 
-    // We only accept RS256 because the OpenHost router only
-    // signs RS256.  Pinning the algorithm at verify-time is the
-    // standard mitigation for the "alg=none" / "alg=HS256 with
-    // public key as secret" classes of JWT attacks.
-    if (header.alg !== 'RS256') {
-      return reject(new Error('unexpected JWT alg: ' + header.alg))
-    }
-    if (!header.kid) {
-      return reject(new Error('JWT missing kid header'))
-    }
-
-    jwks.getSigningKey(header.kid, (err, key) => {
-      if (err) {
-        return reject(new Error('JWKS lookup failed: ' + err.message))
-      }
-      const publicKey = key.getPublicKey()
-      jwt.verify(
-        token,
-        publicKey,
-        {
-          algorithms: ['RS256'],
-          clockTolerance: JWT_CLOCK_TOLERANCE_SEC
-        },
-        (verr, payload) => {
-          if (verr) return reject(new Error('JWT verify failed: ' + verr.message))
-          if (typeof payload !== 'object' || !payload) {
-            return reject(new Error('JWT payload is not an object'))
-          }
-          // Reject tokens with no ``exp`` claim.  jsonwebtoken
-          // only enforces expiry when ``exp`` is present in the
-          // payload — a token that omits the claim entirely is
-          // accepted forever.  We require ``exp`` explicitly
-          // here so a router-issued token without an expiry
-          // can't grant indefinite admin access.  Matches what
-          // auth_proxy.py does (PyJWT's ``options={"require":
-          // ["exp"]}``) on the same JWT.
-          if (typeof payload.exp !== 'number') {
-            return reject(new Error('JWT has no exp claim'))
-          }
-          resolve(payload)
-        }
-      )
+// Resolve the list of candidate public keys to try verification
+// against.  Three cases:
+//  * ``kid`` present + matching JWK in JWKS → the targeted key
+//    is the only candidate (a malicious token with a forged
+//    kid header is mitigated by the matching JWK still
+//    validating the signature, so this is safe).
+//  * ``kid`` present but JWKS lookup fails → we treat that as
+//    no candidate (don't fall through to "try everything", that
+//    would let an attacker force-pick a key by setting an
+//    unknown kid).
+//  * ``kid`` absent → every key in the JWKS is a candidate.
+async function getCandidateSigningKeys (jwks, kid) {
+  if (kid) {
+    return [await new Promise((resolve, reject) => {
+      jwks.getSigningKey(kid, (err, key) => {
+        if (err) return reject(err)
+        resolve(key.getPublicKey())
+      })
+    })]
+  }
+  // No kid: pull the full JWKS and return all keys.  jwks-rsa
+  // exposes ``getKeys`` which returns the full list (this is
+  // the same call ``getSigningKey`` uses internally when the
+  // requested kid is absent from the cache).
+  const keys = await new Promise((resolve, reject) => {
+    jwks.getKeys((err, fetched) => {
+      if (err) return reject(err)
+      resolve(fetched)
     })
   })
+  if (!Array.isArray(keys)) return []
+  return keys
+    .filter(k => k && k.kty === 'RSA')
+    .map(k => {
+      // jwks-rsa returns "raw" JWK objects from getKeys (not
+      // the SigningKey wrapper getSigningKey returns).  We
+      // need to convert each to PEM ourselves.  Use the same
+      // helpers jwks-rsa uses internally — they're exposed on
+      // the module for exactly this purpose.
+      const { JwksClient } = require('jwks-rsa')
+      // Reuse one shared converter so we don't pay the
+      // module-resolution cost on every key.
+      return jwksRsaJwkToPem(k)
+    })
+}
+
+// Lazy import of the jwk-to-pem helper so a future jwks-rsa
+// version that restructures its internals doesn't crash module
+// load — we tolerate the conversion-helper being unavailable
+// and return a more helpful error from getCandidateSigningKeys.
+let _jwkToPem = null
+function jwksRsaJwkToPem (jwk) {
+  if (_jwkToPem === null) {
+    try {
+      _jwkToPem = require('jwk-to-pem')
+    } catch (err) {
+      throw new Error(
+        'jwk-to-pem module unavailable; cannot resolve no-kid JWT against JWKS: ' +
+        err.message
+      )
+    }
+  }
+  return _jwkToPem(jwk)
 }
