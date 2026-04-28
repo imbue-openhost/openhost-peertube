@@ -72,8 +72,13 @@ The flow:
    installed on first boot). The plugin re-verifies the same
    `zone_auth` cookie against the same JWKS and calls
    PeerTube's `userAuthenticated()` external-auth helper with
-   `username=root, role=0` (PeerTube's `UserRole.Administrator`
-   is the integer `0` in the enum).
+   `username=openhost, role=0` (PeerTube's
+   `UserRole.Administrator` is the integer `0` in the enum).
+   The first SSO sign-in creates a dedicated PeerTube user
+   named `openhost` via PeerTube's `createUserFromExternal`;
+   subsequent sign-ins for the same zone owner re-use that
+   user. The PeerTube installer's auto-generated `root` user
+   stays as the break-glass password-login path.
 4. PeerTube generates a one-time `externalAuthToken`, stores
    `(token → user)` in an in-memory map for ~5 minutes, and
    redirects the browser to `/login?externalAuthToken=…&username=root`.
@@ -246,8 +251,9 @@ upload.
 sidecar (see "Auth model" above) bounces the zone owner through
 PeerTube's external-auth flow. Once the container is healthy, click
 the PeerTube tile in your OpenHost dashboard and you'll land
-directly in PeerTube's admin UI as the `root` user. No password
-prompt. The first navigation triggers a brief redirect through
+directly in PeerTube's admin UI as the `openhost` user (created on
+first SSO sign-in via the bundled plugin). No password prompt. The
+first navigation triggers a brief redirect through
 `/plugins/auth-openhost-sso/router/auto-login` →
 `/login?externalAuthToken=…` and the SPA's native login flow does
 the rest; subsequent visits within ~5 minutes skip the bounce
@@ -255,7 +261,12 @@ entirely (the marker cookie suppresses it).
 
 **From outside the zone (PeerTube mobile app, third-party clients,
 break-glass).** Use the `root` username + the password in
-`admin-password.txt`. Read it from inside the container:
+`admin-password.txt`. The `root` user is the auto-generated
+PeerTube installer admin; it remains separate from the SSO-managed
+`openhost` user so password reset / mobile login keeps working
+even if the OpenHost router or the SSO plugin is down.
+
+Read the password from inside the container:
 
 ```
 cat /data/app_data/peertube/admin-password.txt

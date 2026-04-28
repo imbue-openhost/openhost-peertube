@@ -120,17 +120,22 @@ async function register ({
     default: ''
   })
 
-  // Build the synthesised admin-email default from the configured
+  // Build the synthesised owner-email default from the configured
   // webserver hostname.  This is used only when the JWT carries no
   // email claim (the current OpenHost router doesn't include one);
-  // PeerTube's external-auth validator rejects an empty email so we
-  // need *something* — and "admin@<your-zone>" is the value the
-  // sidecar's openhost.toml-time setup already wrote into the root
-  // user's profile.
+  // PeerTube's external-auth validator rejects an empty email so
+  // we need *something* — and ``openhost@<your-zone>`` is a clear
+  // marker that this account belongs to the SSO bridge, not the
+  // upstream installer.  Critically, we use a DIFFERENT local-part
+  // from the auto-generated ``root`` user (``admin@<your-zone>``)
+  // so PeerTube's bypass-login email lookup doesn't find root
+  // and short-circuit into the can't-claim-existing-local-user
+  // path — see the comment in handleAuthRequest for the full
+  // reasoning.
   const webserverUrl = peertubeHelpers.config.getWebserverUrl()
   try {
     const u = new URL(webserverUrl)
-    store.fallbackEmail = `admin@${u.hostname}`
+    store.fallbackEmail = `openhost@${u.hostname}`
   } catch (err) {
     // Fall back to a literal that PeerTube's email validator
     // still accepts.  An invalid webserverUrl is a misconfigured
@@ -140,7 +145,7 @@ async function register ({
       'auth-openhost-sso: cannot parse webserver URL %s; using fallback email',
       webserverUrl
     )
-    store.fallbackEmail = 'admin@localhost'
+    store.fallbackEmail = 'openhost@localhost'
   }
 
   // Resolve and cache the router URL setting.  Wired up to
@@ -458,14 +463,32 @@ async function handleAuthRequest (req, res) {
     ? claims.email
     : store.fallbackEmail
 
-  // The PeerTube root admin is always username=root, role=0
-  // (Administrator — see UserRole enum in
-  // @peertube/peertube-models).  We never let the JWT claim
-  // override these because they're the security boundary: the
-  // OpenHost zone owner gets the PeerTube admin role, period.
-  // Any other visitor is anonymous (zone_auth is owner-only —
-  // the OpenHost router does not issue zone_auth cookies to
-  // non-owners).
+  // The OpenHost owner gets a dedicated PeerTube user named
+  // ``openhost`` with admin role (UserRole.Administrator = 0
+  // in @peertube/peertube-models).  We CAN'T re-use the
+  // upstream-installer-created ``root`` account because PeerTube's
+  // bypass-login machinery refuses to claim a pre-existing local
+  // user (one whose ``pluginAuth`` field is null) for an external
+  // auth method — it falls through to the regular password-grant
+  // flow, which then rejects because we have no password.  See
+  // ``getUser`` in PeerTube's
+  // ``server/core/lib/auth/oauth-model.ts``: the bypass branch
+  // exits with ``return null`` when ``user.pluginAuth === null``,
+  // and the password fallback then sees a missing password and
+  // returns ``invalid_grant``.
+  //
+  // The first owner login therefore creates a NEW user named
+  // ``openhost`` via PeerTube's ``createUserFromExternal`` — its
+  // pluginAuth is set to this plugin's npmName, so subsequent
+  // bypasses for the same owner correctly land on the same user.
+  // The auto-installer's ``root`` user remains as the break-glass
+  // password-login path (PeerTube mobile app, recovery, etc.).
+  //
+  // We never let the JWT claim override the username or role:
+  // they're the security boundary, the zone owner gets admin and
+  // anyone else gets nothing.  ``zone_auth`` is owner-only (the
+  // OpenHost router does not issue it to non-owners), so reaching
+  // this code path implies admin.
   //
   // ``userAuthenticated`` is declared by PeerTube as returning
   // ``void``: its real work (looking up / creating the user,
@@ -478,10 +501,10 @@ async function handleAuthRequest (req, res) {
     store.userAuthenticated({
       req,
       res,
-      username: 'root',
+      username: 'openhost',
       email,
       role: 0,
-      displayName: 'root'
+      displayName: 'OpenHost Owner'
     })
   } catch (err) {
     logger.error('auth-openhost-sso: userAuthenticated call failed', { err })
