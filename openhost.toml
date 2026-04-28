@@ -5,9 +5,14 @@ description = "PeerTube federated video platform: Postgres + Redis + PeerTube + 
 
 [runtime.container]
 image = "Dockerfile"
-# Container port 9000 is the Caddy host-rewriter front-door —
-# Caddy fixes up the Host header (which the OpenHost router
-# strips) and proxies onward to PeerTube on loopback :9001.
+# Container port 9000 is the auth-proxy SSO sidecar — see
+# auth_proxy.py.  It forwards anonymous + federation traffic
+# unchanged to Caddy on loopback :9090, which rewrites the Host
+# header from X-Forwarded-Host (the OpenHost router strips Host)
+# before forwarding to PeerTube on loopback :9001.  For owner
+# requests with a valid zone_auth cookie, the auth-proxy serves
+# a one-time SSO trampoline that mints a PeerTube OAuth2 token
+# and writes it to localStorage so the SPA picks it up.
 # PeerTube reads PEERTUBE_TRUST_PROXY=['127.0.0.1','loopback']
 # (set in start.sh) so it honours the X-Forwarded-* headers the
 # router stamps onto the request.

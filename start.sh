@@ -724,11 +724,15 @@ log "Starting auth-proxy sidecar on :${AUTH_PROXY_LISTEN_PORT} -> Caddy :${CADDY
 # write, the auth-proxy can read, the rest of the world cannot.
 chown root:nogroup "$ADMIN_PW_FILE"
 chmod 640 "$ADMIN_PW_FILE"
-# Ensure the secrets dir is traversable by `nobody` so it can
-# open the file by path.  Other files in the dir remain mode
-# 0600 owned by root (gen_secret default) so an `ls $SECRETS_DIR`
-# from `nobody` lists their names but reads fail.
-chmod 711 "$SECRETS_DIR"
+# The secrets dir starts as 0700 root:root.  We need `nobody` to
+# be able to traverse it (open the file by path), so we chgrp the
+# dir to `nogroup` and set mode 0710 — root has full access,
+# `nogroup` members can traverse + look up entries by name (but
+# not list the directory contents), and everyone else gets nothing.
+# This is tighter than 0711 (which grants traverse to all users
+# on the system) while still letting `nobody` open the file.
+chown root:nogroup "$SECRETS_DIR"
+chmod 710 "$SECRETS_DIR"
 
 # Construct the canonical Host header value PeerTube enforces on
 # /api/v1/oauth-clients/local — that's webserver.hostname plus the

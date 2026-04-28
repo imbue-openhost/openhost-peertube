@@ -50,10 +50,13 @@
 	}
 }
 
-# Caddy listens on :9090.  The auth-proxy sidecar sits in front
-# of it on :9000 (the port advertised in openhost.toml).  When
-# the auth-proxy needs to reach Caddy it goes via 127.0.0.1:9090.
-:9090 {
+# Caddy listens on 127.0.0.1:9090 — loopback only.  The auth-proxy
+# sidecar sits in front of it on :9000 (the port advertised in
+# openhost.toml) and is the only thing that should reach Caddy.
+# Binding loopback ensures a hostile container neighbour or a
+# misconfigured router can't talk to Caddy directly and skip the
+# auth-proxy's header sanitation.
+127.0.0.1:9090 {
 	# Rewrite the Host header from X-Forwarded-Host before
 	# proxying to PeerTube on its loopback port. If the header
 	# is absent (which would only happen if something other

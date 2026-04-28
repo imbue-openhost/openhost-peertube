@@ -53,11 +53,19 @@ cookie, the trampoline is never triggered and they get the standard
 anonymous PeerTube experience.
 
 Header sanitation: client-supplied ``X-OpenHost-User`` and
-``X-OpenHost-Is-Owner`` headers are stripped on every request,
-matching the openhost-nextcloud defence.  ``Authorization`` is
-ALSO stripped on the trampoline path (otherwise a hostile remote
-could send a forged Bearer in their request and have the
-trampoline page echo it back in localStorage).
+``X-OpenHost-Is-Owner`` headers are stripped on every request
+(including federation paths and the trampoline endpoints),
+matching the openhost-nextcloud defence.  These are the headers
+the OpenHost router uses to assert owner identity to the app;
+forging them must never grant privilege.
+
+We do NOT strip ``Authorization``: the SPA, mobile app, and any
+third-party PeerTube client carries its OAuth2 access token in
+that header, and forwarding it untouched is precisely how the
+mobile app + third-party clients keep working.  ``Authorization``
+is application-level auth that PeerTube validates against its own
+token store — the auth-proxy has no business stripping or
+inspecting it.
 """
 
 from __future__ import annotations
@@ -223,6 +231,45 @@ def _is_federation_path(path: str) -> bool:
     """
     path_only = path.split("?", 1)[0].split("#", 1)[0]
     return any(p.match(path_only) for p in FEDERATION_PATH_PATTERNS)
+
+
+def _safe_next_path(raw: str) -> str:
+    """Normalise an attacker-controlled ?next= value to a safe local path.
+
+    Defends against open-redirect:
+      * Anything that isn't a string is rejected → ``/``.
+      * Anything that doesn't start with ``/`` is rejected → ``/``
+        (catches ``http://evil.example/``).
+      * A protocol-relative URL ``//evil.example/...`` IS a path that
+        starts with ``/``, but ``urlparse`` of it produces a
+        ``netloc`` and would resolve to a different origin in the
+        browser.  We reject it explicitly.
+      * ``\\evil.example`` is rejected too (some browsers treat
+        backslashes as path separators after the leading ``/``).
+    The resulting path is always a single-leading-slash, no-netloc
+    same-origin reference, safe to put after ``Location: `` or to
+    drop into ``window.location.replace()``.
+    """
+    if not isinstance(raw, str) or not raw:
+        return "/"
+    # Reject protocol-relative URLs and backslash-prefixed paths.
+    # A path that starts with ``//`` (or ``/\\``) becomes a netloc
+    # reference per RFC 3986 §4.2.
+    if raw.startswith("//") or raw.startswith("/\\") or raw.startswith("/" + chr(0x5C)):
+        return "/"
+    if not raw.startswith("/"):
+        return "/"
+    # Final sanity-check: parse and confirm there's no netloc and
+    # no scheme.  ``urlparse`` is permissive and the prefix checks
+    # above already covered the common cases, but a defence in
+    # depth is cheap and protects against future browser quirks.
+    try:
+        parsed = urllib.parse.urlparse(raw)
+    except Exception:  # noqa: BLE001
+        return "/"
+    if parsed.scheme or parsed.netloc:
+        return "/"
+    return raw
 
 
 # ---------------------------------------------------------------------------
@@ -477,27 +524,35 @@ class PeerTubeOauthBridge:
                 "username": self._username,
                 "password": self._password,
             }
-            resp = requests.post(
+            with requests.post(
                 url,
                 data=data,
                 headers=self._request_headers(),
                 timeout=10,
-            )
-            if resp.status_code == 200:
-                return resp.json()
-            if resp.status_code == 400 and attempt == 0:
-                # Likely stale client creds.  Force-refresh on next
-                # attempt.
-                log.info(
-                    "PeerTube token mint got 400; refreshing client creds"
-                )
+            ) as resp:
+                if resp.status_code == 200:
+                    return resp.json()
+                if resp.status_code == 400 and attempt == 0:
+                    # Likely stale client creds.  Force-refresh on
+                    # the next attempt.  ``continue`` exits the
+                    # ``with`` block first, so the response is
+                    # closed and the urllib3 connection released
+                    # back to the pool before we retry.
+                    log.info(
+                        "PeerTube token mint got 400; refreshing client creds"
+                    )
+                    status_was_400 = True
+                else:
+                    status_was_400 = False
+                    failed_status = resp.status_code
+            if status_was_400:
                 continue
             # Any other status, or 400 on the second attempt, is fatal
-            # for this request.  Don't include the response body in the
-            # log: PeerTube echoes the username back in error
+            # for this request.  Don't include the response body in
+            # the log: PeerTube echoes the username back in error
             # messages and our log destination is shared.
             raise RuntimeError(
-                f"PeerTube token mint failed: HTTP {resp.status_code}"
+                f"PeerTube token mint failed: HTTP {failed_status}"
             )
         raise RuntimeError("PeerTube token mint failed: out of attempts")
 
@@ -678,15 +733,7 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
         # back after writing localStorage.  ``Location`` is sent in
         # latin-1 over the wire; Python urlencode handles non-ASCII
         # by percent-encoding.
-        next_url = self.path
-        # Avoid an open-redirect: only allow same-origin paths.  An
-        # owner clicking a maliciously-crafted link with
-        # ?next=https://evil.example/ wouldn't escape because we
-        # only echo back the request-target as-received and that's
-        # always origin-form when serving a path under our hostname,
-        # but enforce it here anyway as defence in depth.
-        if not next_url.startswith("/"):
-            next_url = "/"
+        next_url = _safe_next_path(self.path)
         target = SSO_LOGIN_PATH + "?" + urllib.parse.urlencode({"next": next_url})
         try:
             self.send_response(302)
@@ -709,15 +756,18 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
         gracefully without needing zone_auth at the page-load time.
         """
         # Parse ?next= to validate it's an origin-form path; never
-        # echo a foreign URL back (open-redirect risk).
+        # echo a foreign URL back (open-redirect risk).  If the
+        # parse fails for any reason we log at DEBUG and fall back
+        # to the safe default ``/`` — silent fallback would mask a
+        # systematic parser failure.
         try:
             parsed = urllib.parse.urlparse(self.path)
             qs = urllib.parse.parse_qs(parsed.query)
-            next_path = qs.get("next", ["/"])[0]
-        except Exception:  # noqa: BLE001
-            next_path = "/"
-        if not isinstance(next_path, str) or not next_path.startswith("/"):
-            next_path = "/"
+            raw_next = qs.get("next", ["/"])[0]
+        except Exception as exc:  # noqa: BLE001
+            log.debug("trampoline ?next= parse failed: %s", exc)
+            raw_next = "/"
+        next_path = _safe_next_path(raw_next)
         # Basic XSS hardening — echo back into JS string literal and
         # HTML attribute.  ``json.dumps`` produces a safe JS string
         # literal even for adversarial inputs (it escapes ``</`` →
@@ -744,7 +794,7 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
 <p><span class="spinner"></span><span id="msg">Signing you in…</span></p>
 <noscript>
   <p class="err">JavaScript is required to sign in to PeerTube via OpenHost SSO.
-     <a href={next_path_attr}>Continue without signing in.</a></p>
+     <a href="{next_path_attr}">Continue without signing in.</a></p>
 </noscript>
 <script>
 (function () {{
@@ -880,24 +930,30 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
         marker_until = int(time.time() + max(SSO_MIN_TOKEN_REMAINING_SEC,
                                              expires_in // 2))
 
-        # ``HttpOnly`` is intentionally OMITTED from the marker
-        # cookie: the trampoline JS doesn't read it (the server
-        # does), but a client-side script could legitimately want
-        # to know whether SSO is active (e.g. to decide whether to
-        # auto-redirect on 401).  The cookie is only a "skip the
-        # trampoline next time" marker; it grants no privilege on
-        # its own.  ``Secure`` + ``SameSite=Lax`` cover the usual
-        # cross-site bases.
-        scheme = "https" if "https" in self.headers.get("X-Forwarded-Proto", "").lower() else "https"
-        # Lax is fine: the trampoline only fires on top-level
-        # navigations, never on cross-site iframes/forms.
+        # Build the marker cookie.  Attributes:
+        #   * Path=/ so it's sent on every same-origin request
+        #     (the auth-proxy needs to read it on every navigation).
+        #   * SameSite=Lax: the trampoline only fires on top-level
+        #     navigations, never on cross-site iframes/forms.
+        #   * Secure when the connection is actually HTTPS (in
+        #     production it always is — the OpenHost router fronts
+        #     us with TLS — but in local dev / lvh.me deployments
+        #     the request reaches us as HTTP, and a Secure cookie
+        #     would be silently dropped by the browser, sending us
+        #     into a re-trampoline loop).
+        #   * HttpOnly is OMITTED on purpose: the cookie is a
+        #     "skip the trampoline next time" marker; it carries
+        #     no privilege.  A client-side script could
+        #     legitimately want to know whether SSO is active.
+        xfp = self.headers.get("X-Forwarded-Proto", "").lower()
+        is_https = "https" in xfp
         cookie_attrs = [
             f"{SSO_MARKER_COOKIE}={marker_until}",
             f"Max-Age={max(0, marker_until - int(time.time()))}",
             "Path=/",
             "SameSite=Lax",
         ]
-        if scheme == "https":
+        if is_https:
             cookie_attrs.append("Secure")
         cookie_value = "; ".join(cookie_attrs)
 
@@ -930,14 +986,27 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
         the trampoline on the next owner visit, which in turn will
         replace the stale localStorage tokens.
         """
+        # Match the cookie attributes from _handle_sso_mint_token
+        # so the unset Set-Cookie addresses the same cookie scope:
+        # Path=/, SameSite=Lax, and Secure when we're on HTTPS.  A
+        # mismatched attribute set can leave the browser holding
+        # onto the original cookie because it treats the unset as
+        # a different cookie.
+        xfp = self.headers.get("X-Forwarded-Proto", "").lower()
+        is_https = "https" in xfp
+        clear_attrs = [
+            f"{SSO_MARKER_COOKIE}=",
+            "Max-Age=0",
+            "Path=/",
+            "SameSite=Lax",
+        ]
+        if is_https:
+            clear_attrs.append("Secure")
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", "0")
-            self.send_header(
-                "Set-Cookie",
-                f"{SSO_MARKER_COOKIE}=; Max-Age=0; Path=/; SameSite=Lax",
-            )
+            self.send_header("Set-Cookie", "; ".join(clear_attrs))
             self.send_header("Cache-Control", "no-store")
             self.send_header("Connection", "close")
             self.end_headers()
@@ -961,6 +1030,20 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
     # Pass-through proxy
     # ----------------------------------------------------------------
     def _proxy(self) -> None:
+        # WebSocket upgrade: PeerTube uses /socket.io for live
+        # transcoding job updates and the embed player.  These
+        # requests carry ``Upgrade: websocket`` and ``Connection:
+        # Upgrade``.  Our normal HTTP proxy path strips Upgrade
+        # and Connection (hop-by-hop) and forces ``Connection:
+        # close``, which would break the handshake.  Detect the
+        # upgrade and switch to a raw bidirectional TCP forwarding
+        # mode that doesn't touch any headers.  This still strips
+        # the SSO trust headers ahead of the upgrade, so an
+        # attacker can't forge owner identity over a WebSocket.
+        if self._is_websocket_upgrade():
+            self._proxy_websocket()
+            return
+
         # Always strip trust headers, even on federation paths.
         cleaned_headers = _strip_headers(
             self.headers.items(),
@@ -1017,6 +1100,214 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
             try:
                 upstream_sock.close()
             except OSError:
+                pass
+
+    def _is_websocket_upgrade(self) -> bool:
+        """True if the request is a WebSocket upgrade per RFC 6455 §4.1."""
+        upgrade = self.headers.get("Upgrade", "").lower().strip()
+        connection = self.headers.get("Connection", "").lower()
+        # ``Connection`` is comma-separated; check for ``upgrade``
+        # as one of the tokens.
+        connection_tokens = {t.strip() for t in connection.split(",")}
+        return upgrade == "websocket" and "upgrade" in connection_tokens
+
+    def _proxy_websocket(self) -> None:
+        """Forward a WebSocket upgrade request bidirectionally.
+
+        We open a TCP connection to upstream, send the entire
+        request (including the Upgrade + Connection: Upgrade
+        headers, and the WebSocket-specific Sec-WebSocket-* trio),
+        read the 101 Switching Protocols response, write it back to
+        the client, and then shuffle bytes in both directions until
+        either side closes.  The auth-proxy's normal hop-by-hop
+        stripping and Connection:close forcing are deliberately
+        bypassed for this path because they would break the
+        handshake.
+
+        We DO strip the SSO trust headers
+        (X-OpenHost-User / X-OpenHost-Is-Owner) before forwarding,
+        same as the HTTP path, so a hostile client can't forge
+        owner identity through a WebSocket request.
+        """
+        # Headers to forward to upstream: drop only the trust
+        # headers and Host (we'll re-write Host below).  Keep
+        # Upgrade, Connection, and the Sec-WebSocket-* headers
+        # intact — those are part of the handshake.
+        ws_drop = ALWAYS_STRIP_HEADERS | frozenset({"host"})
+        cleaned = _strip_headers(self.headers.items(), ws_drop)
+
+        try:
+            upstream_sock = socket.create_connection(
+                (self.upstream_host, self.upstream_port),
+                timeout=STREAM_TIMEOUT_SECONDS,
+            )
+        except OSError as exc:
+            log.warning("upstream connect failed (websocket): %s", exc)
+            self._safe_send_error(502, "Bad Gateway")
+            return
+
+        try:
+            upstream_sock.settimeout(STREAM_TIMEOUT_SECONDS)
+            # Build the request.  We send raw bytes so we don't
+            # have to navigate http.client's framing code path
+            # (which doesn't expose a clean way to defer the
+            # connection's close after the response has been
+            # parsed).
+            request_bytes = bytearray()
+            request_bytes.extend(
+                self._encode_header_bytes(
+                    f"{self.command} {self.path} HTTP/1.1\r\n"
+                )
+            )
+            request_bytes.extend(
+                self._encode_header_bytes(
+                    f"Host: {self.upstream_host}:{self.upstream_port}\r\n"
+                )
+            )
+            for k, v in cleaned:
+                request_bytes.extend(
+                    self._encode_header_bytes(f"{k}: {v}\r\n")
+                )
+            request_bytes.extend(b"\r\n")
+            try:
+                upstream_sock.sendall(bytes(request_bytes))
+            except OSError as exc:
+                log.warning("websocket request send failed: %s", exc)
+                self._safe_send_error(502, "Bad Gateway")
+                return
+
+            # Read the 101 response (or rejection) and any small
+            # remainder bytes that the upstream might have
+            # pipelined into the same packet.  Use the socket
+            # directly (not makefile) so leftover bytes go straight
+            # into the bidirectional copy.
+            response_buf = self._read_until_double_crlf(
+                upstream_sock, max_bytes=HEADER_LINE_CAP
+            )
+            if response_buf is None:
+                self._safe_send_error(502, "Bad Gateway")
+                return
+            head_bytes, tail_bytes = response_buf
+
+            # Forward the response head verbatim to the client.
+            # We do NOT use BaseHTTPRequestHandler.send_response_*
+            # here because we want to preserve every header as-is
+            # (including Upgrade + Connection + Sec-WebSocket-Accept).
+            try:
+                self.wfile.write(head_bytes)
+                if tail_bytes:
+                    self.wfile.write(tail_bytes)
+                self.wfile.flush()
+            except OSError as exc:
+                log.debug("client disconnected during ws handshake: %s", exc)
+                return
+
+            # Bail if upstream rejected the upgrade — no bidirectional
+            # phase needed.  We do a lazy parse just to log; the
+            # client already has whatever upstream said.
+            if not head_bytes.startswith(b"HTTP/1.1 101"):
+                log.info("upstream rejected websocket upgrade")
+                return
+
+            # Bidirectional byte shuffling until either side
+            # closes.  Use a poll loop in two threads (or
+            # selectors) — selectors is simpler and works in a
+            # single thread.
+            self._websocket_pump(self.connection, upstream_sock)
+        finally:
+            try:
+                upstream_sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                upstream_sock.close()
+            except OSError:
+                pass
+
+    @staticmethod
+    def _read_until_double_crlf(
+        sock: socket.socket, max_bytes: int
+    ) -> tuple[bytes, bytes] | None:
+        """Read bytes from ``sock`` until ``\\r\\n\\r\\n``.
+
+        Returns ``(head_including_terminator, leftover_bytes)`` or
+        ``None`` on EOF / overflow.  ``leftover_bytes`` is whatever
+        bytes were read past the header terminator in the same
+        recv() — typically empty for a WebSocket handshake but a
+        misbehaving upstream COULD pipe data immediately after the
+        headers.
+        """
+        buf = bytearray()
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                return None
+            buf.extend(chunk)
+            idx = buf.find(b"\r\n\r\n")
+            if idx >= 0:
+                head = bytes(buf[: idx + 4])
+                tail = bytes(buf[idx + 4 :])
+                return head, tail
+            if len(buf) >= max_bytes:
+                log.warning(
+                    "websocket response head exceeds %d bytes; aborting",
+                    max_bytes,
+                )
+                return None
+
+    @staticmethod
+    def _websocket_pump(
+        client_sock: socket.socket, upstream_sock: socket.socket
+    ) -> None:
+        """Bidirectionally forward bytes between two sockets.
+
+        Returns when either socket closes.  Uses ``selectors`` so a
+        single thread can wait on both directions; this matches the
+        pattern Caddy / nginx use for WebSocket reverse-proxying.
+        """
+        import selectors
+
+        # Reset both sockets to a much shorter timeout for the
+        # bidirectional phase: the original 30-minute end-to-end
+        # cap is fine, but a per-recv timeout helps detect dead
+        # sockets faster.  We use blocking mode + selectors-based
+        # readiness rather than non-blocking + EAGAIN, which is
+        # simpler.
+        for s in (client_sock, upstream_sock):
+            try:
+                s.settimeout(None)
+            except OSError:
+                pass
+
+        sel = selectors.DefaultSelector()
+        sel.register(client_sock, selectors.EVENT_READ, "client")
+        sel.register(upstream_sock, selectors.EVENT_READ, "upstream")
+
+        try:
+            while True:
+                events = sel.select(timeout=STREAM_TIMEOUT_SECONDS)
+                if not events:
+                    log.info("websocket idle timeout; closing")
+                    return
+                for key, _ in events:
+                    if key.data == "client":
+                        src, dst = client_sock, upstream_sock
+                    else:
+                        src, dst = upstream_sock, client_sock
+                    try:
+                        chunk = src.recv(STREAM_CHUNK_BYTES)
+                    except OSError:
+                        return
+                    if not chunk:
+                        return
+                    try:
+                        dst.sendall(chunk)
+                    except OSError:
+                        return
+        finally:
+            try:
+                sel.close()
+            except Exception:  # noqa: BLE001
                 pass
 
     @staticmethod
