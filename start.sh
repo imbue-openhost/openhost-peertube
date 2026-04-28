@@ -839,7 +839,17 @@ _pt_curl() {
     local content_type="${6:-}"
     local body="${7-}"
 
+    # Per-call timeout.  Default 30s is enough for the OAuth
+    # token mint and the settings PUT.  The plugin-install call
+    # legitimately takes much longer because PeerTube's
+    # ``pnpm add file:<path>`` reaches the npm registry to pull
+    # the plugin's runtime deps; callers override the default
+    # via the ``PT_CURL_MAX_TIME`` env var when they need more.
+    local max_time="${PT_CURL_MAX_TIME:-30}"
+
     local -a curl_args=(curl -sS -w '\n%{http_code}'
+        --connect-timeout 10
+        --max-time "$max_time"
         -X "$method"
         -H "Host: $CANONICAL_HOST")
     if [[ -n "$bearer" ]]; then
@@ -947,56 +957,50 @@ PT_ACCESS_TOKEN=$(printf '%s' "$TOKEN_JSON" | parse_json_field users.token acces
     exit 1
 }
 
-# Check whether the plugin is already installed.  PeerTube returns
-# {data: [...], total: N}; we check whether any element of the
-# data array has plugin name ``auth-openhost-sso`` (the
-# short name PeerTube exposes via its admin API — the npmName
-# is the same string with the ``peertube-plugin-`` prefix
-# prepended, but the API returns the short form in the ``name``
-# field).  This check is correct on first boot AND on a
-# re-deploy after a previous remove.
-PLUGIN_LIST_JSON=$(_pt_curl "plugins.list" GET "$PT_ACCESS_TOKEN" \
-    "$PT_LOOPBACK/api/v1/plugins?count=100" "200") || {
+# Check whether the plugin is already installed.  The
+# single-resource lookup ``GET /api/v1/plugins/<npmName>``
+# returns 200 with the plugin's metadata if installed, or 404
+# otherwise — avoids paginating the full plugin list (which
+# could miss us on an instance with hundreds of installed
+# plugins) AND lets us decide install-or-skip from a single
+# request.
+#
+# We accept both 200 and 404 as "not a fatal error".  The body
+# shape disambiguates: PeerTube's plugin object always carries
+# a non-empty ``name`` field, so the presence of that field in
+# a successfully parsed JSON object is the marker for
+# "installed".  An error response (404) is also valid JSON
+# (``{error: ...}``) which lacks ``name``.
+LOOKUP_BODY=$(_pt_curl "plugins.lookup" GET "$PT_ACCESS_TOKEN" \
+    "$PT_LOOPBACK/api/v1/plugins/$PLUGIN_NPM_NAME" \
+    "200 404") || {
     early_exit_teardown
     exit 1
 }
-# We just need a yes/no answer here — extracting the array of
-# names via the existing parse_json_field helper would require
-# n+1 invocations (one to learn the data length, n more to read
-# each name); instead we use a tiny dedicated helper that
-# mirrors parse_json_field's error-handling shape for a
-# membership-test predicate.  Keeps the FATAL-log format
-# identical to the rest of the boot path.
-contains_plugin_named() {
-    # Args: <label> <plugin name to look for>.  Reads JSON from
-    # stdin, prints "yes" or "no" to stdout, exits 1 on parse
-    # failure (same as parse_json_field).
-    local label="$1" want="$2"
-    LABEL="$label" WANT="$want" python3 -c '
-import json, os, sys
-label = os.environ["LABEL"]
-want = os.environ["WANT"]
+INSTALLED=$(printf '%s' "$LOOKUP_BODY" | python3 -c '
+import json, sys
 try:
     data = json.load(sys.stdin)
-except json.JSONDecodeError as exc:
-    sys.stderr.write(f"[openhost-peertube] FATAL: {label}: response is not JSON: {exc}\n")
-    sys.exit(1)
-items = data.get("data") or []
-hit = any(item.get("name") == want for item in items if isinstance(item, dict))
-print("yes" if hit else "no")
-'
-}
-INSTALLED=$(printf '%s' "$PLUGIN_LIST_JSON" | contains_plugin_named "plugins.list" "auth-openhost-sso") || {
-    early_exit_teardown
-    exit 1
-}
+except json.JSONDecodeError:
+    print("no")
+    sys.exit(0)
+print("yes" if isinstance(data, dict) and data.get("name") else "no")
+')
 
 if [[ "$INSTALLED" == "yes" ]]; then
     log "Plugin auth-openhost-sso already installed"
 else
     log "Installing plugin auth-openhost-sso from $PLUGIN_DIR"
     INSTALL_PAYLOAD=$(python3 -c 'import json,os; print(json.dumps({"path": os.environ["PLUGIN_DIR"]}))')
-    _pt_curl "plugins.install" POST "$PT_ACCESS_TOKEN" \
+    # Bump the per-call timeout: PeerTube installs plugins via
+    # ``pnpm add file:<path>``, which fetches the plugin's
+    # runtime deps (jsonwebtoken, jwks-rsa) from the npm
+    # registry.  Network round-trips to npm + pnpm's hash
+    # verification dominate the time; 5 minutes is a generous
+    # ceiling that still produces a clean FATAL log on a
+    # genuinely-stuck install instead of hanging boot
+    # indefinitely.
+    PT_CURL_MAX_TIME=300 _pt_curl "plugins.install" POST "$PT_ACCESS_TOKEN" \
         "$PT_LOOPBACK/api/v1/plugins/install" \
         "200 204" \
         "application/json" "$INSTALL_PAYLOAD" >/dev/null || {
