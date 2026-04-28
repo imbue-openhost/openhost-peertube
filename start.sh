@@ -696,7 +696,7 @@ fi
 # because OPENHOST_ROUTER_URL can change across container
 # restarts (e.g. when the operator moves to a new host).
 
-PLUGIN_DIR=/opt/openhost-peertube/peertube-plugin-auth-openhost-sso
+export PLUGIN_DIR=/opt/openhost-peertube/peertube-plugin-auth-openhost-sso
 PLUGIN_NPM_NAME=peertube-plugin-auth-openhost-sso
 
 if [[ -z "${OPENHOST_ROUTER_URL:-}" ]]; then
@@ -759,6 +759,12 @@ fi
 # captures further along.  The path is a list of keys/indices
 # (passed as separate argv entries) so callers don't have to
 # string-mangle their own JSON path.
+#
+# We pass the script via ``python3 -c`` (NOT ``python3 -`` with a
+# heredoc) because the heredoc form would feed the heredoc into
+# python's stdin, which is the same channel ``json.load`` wants
+# to read the JSON body from.  ``-c`` keeps stdin available for
+# the JSON.
 parse_json_field() {
     # Args: a stream-friendly description for logs ("plugins.list"
     # etc.), then 1+ keys describing the path.  Reads JSON from
@@ -767,7 +773,7 @@ parse_json_field() {
     # early_exit_teardown + exit.
     local label="$1"
     shift
-    python3 - "$label" "$@" <<'PYEOF'
+    python3 -c '
 import json, sys
 label = sys.argv[1]
 keys = sys.argv[2:]
@@ -796,7 +802,96 @@ if not isinstance(node, (str, int, float)):
     )
     sys.exit(1)
 print(node)
-PYEOF
+' "$label" "$@"
+}
+
+# Helper: GET a JSON endpoint and capture the body + HTTP status.
+# Wraps curl so a non-2xx response surfaces as a clean operator
+# message (with the response body for diagnosis) instead of
+# letting set -e abort the script with no context, AND so a
+# transport failure (refused connect, DNS failure, timeout)
+# triggers early_exit_teardown rather than orphaning the rest
+# of the supervised children.
+#
+# Usage:  body=$(http_get_json "<label>" "<auth-bearer-or-empty>" "<url>")
+#         "$body" is set, function returns 1 on failure, caller
+#         is expected to early_exit_teardown + exit on non-zero.
+http_get_json() {
+    local label="$1" bearer="$2" url="$3"
+    local raw code body
+    local -a curl_args=(curl -sS -w '\n%{http_code}' -H "Host: $CANONICAL_HOST")
+    if [[ -n "$bearer" ]]; then
+        curl_args+=(-H "Authorization: Bearer $bearer")
+    fi
+    curl_args+=("$url")
+    if ! raw=$("${curl_args[@]}" 2>&1); then
+        log "FATAL: $label: curl transport failure: $raw"
+        return 1
+    fi
+    code="${raw##*$'\n'}"
+    body="${raw%$'\n'*}"
+    if [[ "$code" != "200" ]]; then
+        log "FATAL: $label: HTTP $code: $body"
+        return 1
+    fi
+    printf '%s' "$body"
+}
+
+# POST a urlencoded body via stdin.  Same error contract as
+# http_get_json above.
+http_post_urlencoded_json() {
+    local label="$1" bearer="$2" url="$3" body="$4"
+    local raw code resp
+    local -a curl_args=(curl -sS -w '\n%{http_code}'
+        -H "Host: $CANONICAL_HOST"
+        -H "Content-Type: application/x-www-form-urlencoded")
+    if [[ -n "$bearer" ]]; then
+        curl_args+=(-H "Authorization: Bearer $bearer")
+    fi
+    curl_args+=(--data-binary @- "$url")
+    if ! raw=$(printf '%s' "$body" | "${curl_args[@]}" 2>&1); then
+        log "FATAL: $label: curl transport failure: $raw"
+        return 1
+    fi
+    code="${raw##*$'\n'}"
+    resp="${raw%$'\n'*}"
+    if [[ "$code" != "200" ]]; then
+        log "FATAL: $label: HTTP $code: $resp"
+        return 1
+    fi
+    printf '%s' "$resp"
+}
+
+# POST/PUT a JSON body.  Body is an already-formatted JSON string
+# passed via --data-binary so it doesn't go through argv.
+# ``method`` is GET/POST/PUT (curl -X).  ``ok_codes`` is a space-
+# separated list of HTTP codes the caller treats as success;
+# anything else is a FATAL.
+http_send_json() {
+    local label="$1" method="$2" bearer="$3" url="$4" body="$5" ok_codes="$6"
+    local raw code resp
+    local -a curl_args=(curl -sS -w '\n%{http_code}' -X "$method"
+        -H "Host: $CANONICAL_HOST"
+        -H "Content-Type: application/json")
+    if [[ -n "$bearer" ]]; then
+        curl_args+=(-H "Authorization: Bearer $bearer")
+    fi
+    curl_args+=(--data-binary @- "$url")
+    if ! raw=$(printf '%s' "$body" | "${curl_args[@]}" 2>&1); then
+        log "FATAL: $label: curl transport failure: $raw"
+        return 1
+    fi
+    code="${raw##*$'\n'}"
+    resp="${raw%$'\n'*}"
+    local matched=0
+    for ok in $ok_codes; do
+        if [[ "$code" == "$ok" ]]; then matched=1; break; fi
+    done
+    if [[ $matched -ne 1 ]]; then
+        log "FATAL: $label: HTTP $code (expected one of: $ok_codes): $resp"
+        return 1
+    fi
+    printf '%s' "$resp"
 }
 
 # Fetch + parse the OAuth client_id/client_secret.  Stash the
@@ -804,9 +899,10 @@ PYEOF
 # the SAME response; a per-parse curl invocation could race a
 # client-creds rotation (rare but possible — PeerTube rotates
 # the local client creds across restarts).
-OAUTH_CLIENT_JSON=$(curl -sS \
-    -H "Host: $CANONICAL_HOST" \
-    "$PT_LOOPBACK/api/v1/oauth-clients/local")
+OAUTH_CLIENT_JSON=$(http_get_json "oauth-clients.local" "" "$PT_LOOPBACK/api/v1/oauth-clients/local") || {
+    early_exit_teardown
+    exit 1
+}
 PT_CLIENT_ID=$(printf '%s' "$OAUTH_CLIENT_JSON" | parse_json_field oauth-clients.local client_id) || {
     early_exit_teardown
     exit 1
@@ -840,12 +936,10 @@ TOKEN_BODY=$(printf 'client_id=%s&client_secret=%s&grant_type=password&response_
     "$(url_encode "$PT_CLIENT_ID")" \
     "$(url_encode "$PT_CLIENT_SECRET")" \
     "$(url_encode "$PT_ADMIN_PW")")
-TOKEN_JSON=$(printf '%s' "$TOKEN_BODY" \
-    | curl -sS \
-        -H "Host: $CANONICAL_HOST" \
-        -H "Content-Type: application/x-www-form-urlencoded" \
-        --data-binary @- \
-        "$PT_LOOPBACK/api/v1/users/token")
+TOKEN_JSON=$(http_post_urlencoded_json "users.token" "" "$PT_LOOPBACK/api/v1/users/token" "$TOKEN_BODY") || {
+    early_exit_teardown
+    exit 1
+}
 PT_ACCESS_TOKEN=$(printf '%s' "$TOKEN_JSON" | parse_json_field users.token access_token) || {
     log "FATAL: could not obtain PeerTube admin token for plugin install"
     early_exit_teardown
@@ -860,11 +954,11 @@ PT_ACCESS_TOKEN=$(printf '%s' "$TOKEN_JSON" | parse_json_field users.token acces
 # prepended, but the API returns the short form in the ``name``
 # field).  This check is correct on first boot AND on a
 # re-deploy after a previous remove.
-PLUGIN_LIST_JSON=$(curl -sS \
-    -H "Host: $CANONICAL_HOST" \
-    -H "Authorization: Bearer $PT_ACCESS_TOKEN" \
-    "$PT_LOOPBACK/api/v1/plugins?count=100")
-INSTALLED=$(printf '%s' "$PLUGIN_LIST_JSON" | python3 - <<'PYEOF'
+PLUGIN_LIST_JSON=$(http_get_json "plugins.list" "$PT_ACCESS_TOKEN" "$PT_LOOPBACK/api/v1/plugins?count=100") || {
+    early_exit_teardown
+    exit 1
+}
+INSTALLED=$(printf '%s' "$PLUGIN_LIST_JSON" | python3 -c '
 import json, sys
 try:
     data = json.load(sys.stdin)
@@ -874,8 +968,7 @@ except json.JSONDecodeError as exc:
 items = data.get("data") or []
 hit = any(item.get("name") == "auth-openhost-sso" for item in items if isinstance(item, dict))
 print("yes" if hit else "no")
-PYEOF
-) || {
+') || {
     early_exit_teardown
     exit 1
 }
@@ -884,19 +977,14 @@ if [[ "$INSTALLED" == "yes" ]]; then
     log "Plugin auth-openhost-sso already installed"
 else
     log "Installing plugin auth-openhost-sso from $PLUGIN_DIR"
-    INSTALL_RESPONSE=$(curl -sS -w '\n%{http_code}' \
-        -H "Host: $CANONICAL_HOST" \
-        -H "Authorization: Bearer $PT_ACCESS_TOKEN" \
-        -H "Content-Type: application/json" \
-        --data "{\"path\": \"$PLUGIN_DIR\"}" \
-        "$PT_LOOPBACK/api/v1/plugins/install")
-    INSTALL_CODE="${INSTALL_RESPONSE##*$'\n'}"
-    INSTALL_BODY="${INSTALL_RESPONSE%$'\n'*}"
-    if [[ "$INSTALL_CODE" != "200" && "$INSTALL_CODE" != "204" ]]; then
-        log "FATAL: plugin install failed (HTTP $INSTALL_CODE): $INSTALL_BODY"
+    INSTALL_PAYLOAD=$(python3 -c 'import json,os; print(json.dumps({"path": os.environ["PLUGIN_DIR"]}))')
+    http_send_json "plugins.install" POST "$PT_ACCESS_TOKEN" \
+        "$PT_LOOPBACK/api/v1/plugins/install" \
+        "$INSTALL_PAYLOAD" \
+        "200 204" >/dev/null || {
         early_exit_teardown
         exit 1
-    fi
+    }
 fi
 
 # Always re-set the openhost-router-url setting.  PeerTube
@@ -909,20 +997,13 @@ fi
 # us.
 log "Configuring plugin (router URL: $OPENHOST_ROUTER_URL)"
 SETTINGS_PAYLOAD=$(python3 -c "import json,os; print(json.dumps({'settings': {'openhost-router-url': os.environ['OPENHOST_ROUTER_URL']}}))")
-SETTINGS_RESPONSE=$(curl -sS -w '\n%{http_code}' \
-    -H "Host: $CANONICAL_HOST" \
-    -H "Authorization: Bearer $PT_ACCESS_TOKEN" \
-    -H "Content-Type: application/json" \
-    -X PUT \
-    --data "$SETTINGS_PAYLOAD" \
-    "$PT_LOOPBACK/api/v1/plugins/$PLUGIN_NPM_NAME/settings")
-SETTINGS_CODE="${SETTINGS_RESPONSE##*$'\n'}"
-SETTINGS_BODY="${SETTINGS_RESPONSE%$'\n'*}"
-if [[ "$SETTINGS_CODE" != "204" ]]; then
-    log "FATAL: plugin settings update failed (HTTP $SETTINGS_CODE): $SETTINGS_BODY"
+http_send_json "plugins.settings" PUT "$PT_ACCESS_TOKEN" \
+    "$PT_LOOPBACK/api/v1/plugins/$PLUGIN_NPM_NAME/settings" \
+    "$SETTINGS_PAYLOAD" \
+    "204" >/dev/null || {
     early_exit_teardown
     exit 1
-fi
+}
 
 # -----------------------------------------------------------------
 # Start auth-proxy sidecar (OpenHost zone_auth → SSO bounce)

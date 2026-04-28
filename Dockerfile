@@ -120,6 +120,16 @@ COPY peertube-plugin-auth-openhost-sso /opt/openhost-peertube/peertube-plugin-au
 # of the RUN command, which would silently drop everything after
 # the first line.  Keep all the comments out of the RUN and use
 # `\` only between actual command tokens.
+#
+# Note: pnpm fetches the plugin's runtime npm dependencies
+# (jsonwebtoken, jwks-rsa) from the public npm registry on first
+# boot, when PeerTube's plugin-install API runs ``pnpm add
+# file:<path>`` against this directory.  This requires outbound
+# internet access from the container at first-boot time.  The
+# container that runs this image already needs outbound internet
+# (PeerTube fetches video plugin metadata, the OpenHost router
+# does TLS cert provisioning, etc.) so this isn't an additional
+# constraint in practice.
 RUN chmod +x /opt/openhost-peertube/start.sh \
  && chown -R peertube:peertube \
         /opt/openhost-peertube/peertube-plugin-auth-openhost-sso

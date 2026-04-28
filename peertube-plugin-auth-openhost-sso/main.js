@@ -199,10 +199,11 @@ async function register ({
 
 async function unregister () {
   // Pull the external-auth registration out of PeerTube's
-  // in-memory map so a hot-reload (uninstall / reinstall via
-  // the admin UI, or a settings change that triggers re-init)
+  // in-memory map so an uninstall / reinstall via the admin UI
   // doesn't leave a stale entry pointing at the now-nulled
-  // ``store.userAuthenticated`` callback.
+  // ``store.userAuthenticated`` callback.  (Settings changes
+  // don't flow through here — they call loadRouterSetting()
+  // directly via onSettingsChange.)
   if (typeof store.unregisterExternalAuth === 'function') {
     try {
       store.unregisterExternalAuth(AUTH_NAME)
@@ -464,12 +465,22 @@ function verifyOwnerJwt (token, jwks) {
         publicKey,
         {
           algorithms: ['RS256'],
-          clockTolerance: JWT_CLOCK_TOLERANCE_SEC
+          clockTolerance: JWT_CLOCK_TOLERANCE_SEC,
+          // Reject tokens with no ``exp`` claim.  Without this, a
+          // router-issued JWT that omits ``exp`` would be accepted
+          // forever, even after the operator rotates keys (the
+          // signature would still verify against the cached JWKS
+          // entry, with no expiry to invalidate it).  Matches what
+          // auth_proxy.py does on the same JWT.
+          complete: false
         },
         (verr, payload) => {
           if (verr) return reject(new Error('JWT verify failed: ' + verr.message))
           if (typeof payload !== 'object' || !payload) {
             return reject(new Error('JWT payload is not an object'))
+          }
+          if (typeof payload.exp !== 'number') {
+            return reject(new Error('JWT has no exp claim'))
           }
           resolve(payload)
         }

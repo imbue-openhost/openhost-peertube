@@ -210,12 +210,9 @@ FEDERATION_PATH_PATTERNS = [
     re.compile(r"^/api/v1/users/revoke-token$"),
     # The login page itself — we just bounced the owner here from
     # the plugin's auto-login route.  Bouncing them BACK would
-    # produce a redirect loop.
+    # produce a redirect loop.  (The /plugins/* prefix below also
+    # protects the plugin's own routes from being bounced.)
     re.compile(r"^/login(/|$|\?)"),
-    # The external-auth plugin route family — the bounce target
-    # itself plus any future per-version variants.  Bouncing any
-    # of these would loop.
-    re.compile(r"^/plugins/auth-openhost-sso(/|$)"),
     # SPA assets — anonymous viewers need these to load the
     # client.  Asset paths are loaded with Accept: */* anyway so
     # the bounce filter wouldn't fire on them, but listing them
@@ -577,7 +574,12 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
         #     until it expires.
         cookies = _parse_cookie_header(self.headers.get("Cookie"))
         zone_token = cookies.get(ZONE_COOKIE, "")
-        has_marker = bool(cookies.get(SSO_MARKER_COOKIE, ""))
+        # Presence-only check (any value, including empty string)
+        # matches the documented contract on SSO_MARKER_COOKIE: the
+        # marker says "I just bounced you, don't re-bounce" and the
+        # value is irrelevant.  ``in`` on the parsed cookie dict is
+        # the cleanest way to express that.
+        has_marker = SSO_MARKER_COOKIE in cookies
 
         is_owner = False
         if zone_token and self.jwks is not None:
