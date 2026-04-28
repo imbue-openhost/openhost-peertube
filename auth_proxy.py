@@ -97,6 +97,14 @@ JWKS_REFRESH_INTERVAL_SEC = 600
 # We use the un-versioned form of the plugin custom-router URL
 # (``/plugins/<name>/router/<route>``) so a plugin version bump
 # doesn't require also updating this constant.
+#
+# COUPLING: this string MUST match the route registered in the
+# plugin's main.js (``router.get('/auto-login', ...)``).  If the
+# plugin route is renamed, this constant must be updated too —
+# the matching ``/auto-login`` literal lives at the
+# ``router.get`` call in
+# ``peertube-plugin-auth-openhost-sso/main.js``.  No automated
+# check enforces the agreement; renaming requires care.
 SSO_BOUNCE_PATH = "/plugins/auth-openhost-sso/router/auto-login"
 
 # Marker cookie the sidecar sets when it bounces an owner to the

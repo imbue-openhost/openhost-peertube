@@ -19,7 +19,7 @@
   "clientScripts": [],
   "translations": {},
   "dependencies": {
-    "jsonwebtoken": "^9.0.2",
-    "jwks-rsa": "^3.1.0"
+    "jsonwebtoken": "9.0.2",
+    "jwks-rsa": "3.1.0"
   }
 }

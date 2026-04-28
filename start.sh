@@ -687,7 +687,11 @@ fi
 # openhost-plane.so uses for its check-session sidecar:
 # the app's own auth machinery is what logs the user in.  The
 # sidecar's only job is bouncing the owner browser to the
-# plugin's auto-login URL on first visit.
+# plugin's auto-login URL on owner navigations whose
+# request doesn't already carry the bounce-marker cookie —
+# typically the first visit, but also any subsequent visit
+# after the marker's 5-minute TTL has elapsed (or after the
+# owner explicitly logs out and the SPA clears its tokens).
 #
 # We talk to the PeerTube admin API as the root user using the
 # admin password generated above.  Idempotent: we read the
@@ -812,7 +816,7 @@ print(node)
 # the rest of the supervised children.
 #
 # Usage:
-#     body=$(_pt_curl <label> <method> <bearer-or-empty> <url> \
+#     body=$(pt_curl <label> <method> <bearer-or-empty> <url> \
 #                     <ok-codes> [<content-type>] [<body>])
 #
 #  * ``label``        — short identifier for the FATAL log line.
@@ -834,7 +838,7 @@ print(node)
 # off the response splitter, which extracts the HTTP code as
 # the LAST line of stdout.  Transport failures still surface
 # via curl's non-zero exit code, which we check.
-_pt_curl() {
+pt_curl() {
     local label="$1" method="$2" bearer="$3" url="$4" ok_codes="$5"
     local content_type="${6:-}"
     local body="${7-}"
@@ -899,7 +903,7 @@ _pt_curl() {
 # the SAME response; a per-parse curl invocation could race a
 # client-creds rotation (rare but possible — PeerTube rotates
 # the local client creds across restarts).
-OAUTH_CLIENT_JSON=$(_pt_curl "oauth-clients.local" GET "" \
+OAUTH_CLIENT_JSON=$(pt_curl "oauth-clients.local" GET "" \
     "$PT_LOOPBACK/api/v1/oauth-clients/local" "200") || {
     early_exit_teardown
     exit 1
@@ -945,7 +949,7 @@ TOKEN_BODY=$(printf 'client_id=%s&client_secret=%s&grant_type=password&response_
     "$(url_encode "$PT_CLIENT_ID")" \
     "$(url_encode "$PT_CLIENT_SECRET")" \
     "$(url_encode "$PT_ADMIN_PW")")
-TOKEN_JSON=$(_pt_curl "users.token" POST "" \
+TOKEN_JSON=$(pt_curl "users.token" POST "" \
     "$PT_LOOPBACK/api/v1/users/token" "200" \
     "application/x-www-form-urlencoded" "$TOKEN_BODY") || {
     early_exit_teardown
@@ -971,12 +975,13 @@ PT_ACCESS_TOKEN=$(printf '%s' "$TOKEN_JSON" | parse_json_field users.token acces
 # a successfully parsed JSON object is the marker for
 # "installed".  An error response (404) is also valid JSON
 # (``{error: ...}``) which lacks ``name``.
-LOOKUP_BODY=$(_pt_curl "plugins.lookup" GET "$PT_ACCESS_TOKEN" \
+LOOKUP_BODY=$(pt_curl "plugins.lookup" GET "$PT_ACCESS_TOKEN" \
     "$PT_LOOPBACK/api/v1/plugins/$PLUGIN_NPM_NAME" \
     "200 404") || {
     early_exit_teardown
     exit 1
 }
+INSTALLED=""
 INSTALLED=$(printf '%s' "$LOOKUP_BODY" | python3 -c '
 import json, sys
 try:
@@ -985,13 +990,26 @@ except json.JSONDecodeError:
     print("no")
     sys.exit(0)
 print("yes" if isinstance(data, dict) and data.get("name") else "no")
-')
+') || {
+    log "FATAL: plugins.lookup: install-state probe crashed"
+    early_exit_teardown
+    exit 1
+}
+if [[ -z "$INSTALLED" ]]; then
+    log "FATAL: plugins.lookup: install-state probe produced empty output"
+    early_exit_teardown
+    exit 1
+fi
 
 if [[ "$INSTALLED" == "yes" ]]; then
     log "Plugin auth-openhost-sso already installed"
 else
     log "Installing plugin auth-openhost-sso from $PLUGIN_DIR"
-    INSTALL_PAYLOAD=$(python3 -c 'import json,os; print(json.dumps({"path": os.environ["PLUGIN_DIR"]}))')
+    INSTALL_PAYLOAD=$(python3 -c 'import json,os; print(json.dumps({"path": os.environ["PLUGIN_DIR"]}))') || {
+        log "FATAL: plugins.install: failed to build request payload"
+        early_exit_teardown
+        exit 1
+    }
     # Bump the per-call timeout: PeerTube installs plugins via
     # ``pnpm add file:<path>``, which fetches the plugin's
     # runtime deps (jsonwebtoken, jwks-rsa) from the npm
@@ -1000,7 +1018,7 @@ else
     # ceiling that still produces a clean FATAL log on a
     # genuinely-stuck install instead of hanging boot
     # indefinitely.
-    PT_CURL_MAX_TIME=300 _pt_curl "plugins.install" POST "$PT_ACCESS_TOKEN" \
+    PT_CURL_MAX_TIME=300 pt_curl "plugins.install" POST "$PT_ACCESS_TOKEN" \
         "$PT_LOOPBACK/api/v1/plugins/install" \
         "200 204" \
         "application/json" "$INSTALL_PAYLOAD" >/dev/null || {
@@ -1018,8 +1036,12 @@ fi
 # rotated keys on the OpenHost router side without restarting
 # us.
 log "Configuring plugin (router URL: $OPENHOST_ROUTER_URL)"
-SETTINGS_PAYLOAD=$(python3 -c "import json,os; print(json.dumps({'settings': {'openhost-router-url': os.environ['OPENHOST_ROUTER_URL']}}))")
-_pt_curl "plugins.settings" PUT "$PT_ACCESS_TOKEN" \
+SETTINGS_PAYLOAD=$(python3 -c "import json,os; print(json.dumps({'settings': {'openhost-router-url': os.environ['OPENHOST_ROUTER_URL']}}))") || {
+    log "FATAL: plugins.settings: failed to build request payload"
+    early_exit_teardown
+    exit 1
+}
+pt_curl "plugins.settings" PUT "$PT_ACCESS_TOKEN" \
     "$PT_LOOPBACK/api/v1/plugins/$PLUGIN_NPM_NAME/settings" \
     "204" \
     "application/json" "$SETTINGS_PAYLOAD" >/dev/null || {

@@ -115,8 +115,8 @@ async function register ({
     descriptionHTML:
       'Internal URL of the OpenHost router used to fetch the JWKS for ' +
       "owner JWT verification (e.g. <code>http://host.containers.internal:8080</code>). " +
-      'Set automatically by start.sh on first boot — operators should ' +
-      'not normally touch this.',
+      'Set automatically by start.sh on every container boot — ' +
+      'operators should not normally touch this.',
     default: ''
   })
 
@@ -147,7 +147,22 @@ async function register ({
   // settingsManager.onSettingsChange so a runtime edit (eg. when
   // the operator manually fixes a broken value) takes effect
   // without a PeerTube restart.
-  await loadRouterSetting(settingsManager)
+  //
+  // Both call sites — the initial load here and the re-load on
+  // settings changes — wrap the await in a try/catch.  An
+  // unhandled rejection escaping ``register()`` would prevent
+  // the plugin from completing registration, leaving PeerTube
+  // with a half-installed plugin entry that can't be cleanly
+  // removed without a restart.  Logging the error and
+  // continuing means the plugin is registered but
+  // owner-detection is disabled until the operator fixes the
+  // setting — handleAuthRequest already redirects to /login
+  // when ``store.jwks`` is null, so this degrades gracefully.
+  try {
+    await loadRouterSetting(settingsManager)
+  } catch (err) {
+    logger.error('auth-openhost-sso: initial settings load failed', { err })
+  }
   settingsManager.onSettingsChange(async () => {
     try {
       await loadRouterSetting(settingsManager)
@@ -169,6 +184,10 @@ async function register ({
   // ``runHandler`` which awaits and routes any unanticipated
   // rejection through the same login-failure redirect the
   // handler would have returned itself.
+  // COUPLING: ``/auto-login`` is the path the auth-proxy
+  // sidecar's ``SSO_BOUNCE_PATH`` constant in auth_proxy.py
+  // points at.  The two strings must agree; if you rename one,
+  // rename the other in the same change.
   const router = getRouter()
   router.get('/auto-login', (req, res) => runHandler(req, res))
 
