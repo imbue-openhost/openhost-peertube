@@ -717,6 +717,7 @@ fi
 # is good for ~24h; we use it for a few seconds and let it expire
 # naturally.
 log "Minting admin OAuth token for plugin install"
+log "DIAG PEERTUBE_STORAGE_PLUGINS=${PEERTUBE_STORAGE_PLUGINS:-(unset)}"
 PT_LOOPBACK="http://127.0.0.1:9001"
 
 # Helper: curl with the canonical Host header so PeerTube's
