@@ -621,11 +621,21 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
         """
         next_url = _safe_next_path(self.path)
         target = SSO_BOUNCE_PATH + "?" + urllib.parse.urlencode({"next": next_url})
-        marker_until = int(time.time() + SSO_MARKER_TTL_SEC)
+        # The marker's expiry timestamp is used by
+        # ``_build_marker_cookie`` to compute the ``Max-Age``
+        # attribute and (for backwards-compatibility with operators
+        # who debug via cookie inspection) is also embedded in the
+        # cookie value.  The dispatch-layer presence check
+        # (``SSO_MARKER_COOKIE in cookies``) ignores the value
+        # entirely; only Max-Age governs when the browser stops
+        # sending it.
+        marker_expires_at = int(time.time() + SSO_MARKER_TTL_SEC)
         try:
             self.send_response(302)
             self.send_header("Location", target)
-            self.send_header("Set-Cookie", self._build_marker_cookie(marker_until))
+            self.send_header(
+                "Set-Cookie", self._build_marker_cookie(marker_expires_at)
+            )
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", "0")
             self.send_header("Connection", "close")
@@ -633,7 +643,7 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
         except OSError as exc:
             log.debug("client disconnected during SSO bounce: %s", exc)
 
-    def _build_marker_cookie(self, marker_until: int) -> str:
+    def _build_marker_cookie(self, marker_expires_at: int) -> str:
         """Build the marker-cookie ``Set-Cookie`` header value.
 
         ``Secure`` is added only on HTTPS — set based on the
@@ -654,9 +664,9 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
         is_https = any(
             tok.strip() == "https" for tok in xfp.split(",")
         )
-        max_age = max(0, marker_until - int(time.time()))
+        max_age = max(0, marker_expires_at - int(time.time()))
         attrs = [
-            f"{SSO_MARKER_COOKIE}={marker_until}",
+            f"{SSO_MARKER_COOKIE}={marker_expires_at}",
             f"Max-Age={max_age}",
             "Path=/",
             "SameSite=Lax",

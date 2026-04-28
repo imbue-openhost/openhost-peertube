@@ -354,6 +354,22 @@ async function loadRouterSetting (settingsManager) {
 
 async function handleAuthRequest (req, res) {
   const logger = store.logger
+  // ``req.query.next`` is set by the auth-proxy sidecar's
+  // bounce as the originally-requested path.  We currently
+  // ignore it: PeerTube's ``userAuthenticated`` redirects to
+  // /login?externalAuthToken=…, and the SPA's login page picks
+  // its own post-login destination from the
+  // SESSION_STORAGE_REDIRECT_URL_KEY entry it writes when an
+  // anonymous request was deflected to /login.  Honouring
+  // ``next`` here would require either passing it as
+  // ``externalRedirectUri`` (which PeerTube validates against
+  // an allowed-list of URIs and is the wrong layer for an
+  // origin-relative path), or adding a custom client-side
+  // hook that reads it from the URL and stuffs it into the
+  // SPA's redirect storage.  Both add complexity for an edge
+  // case (the dashboard tile points at the SPA root anyway),
+  // so we accept the parameter for forward compatibility but
+  // don't act on it.
 
   // Misconfiguration: the plugin is registered but settings
   // weren't seeded.  Fail closed — there's no safe default that
@@ -406,11 +422,20 @@ async function handleAuthRequest (req, res) {
     : store.fallbackEmail
 
   // The PeerTube root admin is always username=root, role=0
-  // (Administrator).  We never let the JWT claim override these
-  // because they're the security boundary: the OpenHost zone
-  // owner gets the PeerTube admin role, period.  Any other
-  // visitor is anonymous (zone_auth is owner-only — the OpenHost
-  // router does not issue zone_auth cookies to non-owners).
+  // (Administrator — see UserRole enum in
+  // @peertube/peertube-models).  We never let the JWT claim
+  // override these because they're the security boundary: the
+  // OpenHost zone owner gets the PeerTube admin role, period.
+  // Any other visitor is anonymous (zone_auth is owner-only —
+  // the OpenHost router does not issue zone_auth cookies to
+  // non-owners).
+  //
+  // ``userAuthenticated`` is declared by PeerTube as returning
+  // ``void``: its real work (looking up / creating the user,
+  // generating the externalAuthToken, writing the redirect to
+  // ``res``) is dispatched async with the failure path wired
+  // up internally via ``.catch(err => logger.error(...))``.
+  // We don't await it.
   logger.info('auth-openhost-sso: owner verified, calling userAuthenticated')
   try {
     store.userAuthenticated({
@@ -465,20 +490,21 @@ function verifyOwnerJwt (token, jwks) {
         publicKey,
         {
           algorithms: ['RS256'],
-          clockTolerance: JWT_CLOCK_TOLERANCE_SEC,
-          // Reject tokens with no ``exp`` claim.  Without this, a
-          // router-issued JWT that omits ``exp`` would be accepted
-          // forever, even after the operator rotates keys (the
-          // signature would still verify against the cached JWKS
-          // entry, with no expiry to invalidate it).  Matches what
-          // auth_proxy.py does on the same JWT.
-          complete: false
+          clockTolerance: JWT_CLOCK_TOLERANCE_SEC
         },
         (verr, payload) => {
           if (verr) return reject(new Error('JWT verify failed: ' + verr.message))
           if (typeof payload !== 'object' || !payload) {
             return reject(new Error('JWT payload is not an object'))
           }
+          // Reject tokens with no ``exp`` claim.  jsonwebtoken
+          // only enforces expiry when ``exp`` is present in the
+          // payload — a token that omits the claim entirely is
+          // accepted forever.  We require ``exp`` explicitly
+          // here so a router-issued token without an expiry
+          // can't grant indefinite admin access.  Matches what
+          // auth_proxy.py does (PyJWT's ``options={"require":
+          // ["exp"]}``) on the same JWT.
           if (typeof payload.exp !== 'number') {
             return reject(new Error('JWT has no exp claim'))
           }

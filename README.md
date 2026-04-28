@@ -72,7 +72,8 @@ The flow:
    installed on first boot). The plugin re-verifies the same
    `zone_auth` cookie against the same JWKS and calls
    PeerTube's `userAuthenticated()` external-auth helper with
-   `username=root, role=Administrator`.
+   `username=root, role=0` (PeerTube's `UserRole.Administrator`
+   is the integer `0` in the enum).
 4. PeerTube generates a one-time `externalAuthToken`, stores
    `(token → user)` in an in-memory map for ~5 minutes, and
    redirects the browser to `/login?externalAuthToken=…&username=root`.
