@@ -56,7 +56,16 @@
 # Binding loopback ensures a hostile container neighbour or a
 # misconfigured router can't talk to Caddy directly and skip the
 # auth-proxy's header sanitation.
-127.0.0.1:9090 {
+#
+# Note on Caddyfile syntax: the site address is plain ``:9090``
+# (matches all Hosts) and the loopback restriction is expressed
+# via the ``bind`` directive.  An address-prefix form like
+# ``127.0.0.1:9090 { ... }`` would be interpreted by Caddy as a
+# Host MATCHER (only respond to requests whose Host header equals
+# ``127.0.0.1``) — which silently breaks all real requests, since
+# our inbound traffic carries Host: 127.0.0.1:9090 (with the port).
+:9090 {
+	bind 127.0.0.1
 	# Rewrite the Host header from X-Forwarded-Host before
 	# proxying to PeerTube on its loopback port. If the header
 	# is absent (which would only happen if something other
