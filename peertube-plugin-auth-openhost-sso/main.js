@@ -505,6 +505,16 @@ async function handleAuthRequest (req, res) {
       email,
       role: 0,
       displayName: 'owner',
+      // Unlimited storage for the owner — they own the disk this
+      // PeerTube is running on, no point bounding their own quota.
+      // PeerTube's UserModel uses NOT NULL constraints on these
+      // columns, so we must supply explicit values for plugin-
+      // created users (the upstream installer's auto-generated
+      // root account gets defaults from the install path; the
+      // bypass-login path doesn't).  ``-1`` is PeerTube's
+      // sentinel for "unlimited".
+      videoQuota: -1,
+      videoQuotaDaily: -1,
       // Without a userUpdater, PeerTube's updateUserFromExternal
       // is a no-op and the displayName / role / email we pass
       // here only get applied on first user creation.  Provide
