@@ -479,9 +479,10 @@ export PEERTUBE_REDIS_HOSTNAME=127.0.0.1
 export PEERTUBE_REDIS_PORT=6379
 export PEERTUBE_REDIS_AUTH="$REDIS_PASSWORD"
 
-# PeerTube runs on 9001 internally; Caddy on 9000 fronts it
-# and rewrites the Host header (see ./Caddyfile and the
-# README.md "Why Caddy" section).
+# PeerTube runs on 9001 internally; the auth-proxy on 9000 fronts
+# Caddy on 9090 fronts PeerTube on 9001 (see openhost.toml + the
+# README.md "Auth model" section for the full topology and the
+# rationale for the auth-proxy mid-tier).
 #
 # The v7.3.0 production image's custom-environment-variables.yaml
 # does NOT map PEERTUBE_LISTEN_PORT — that mapping was added on
@@ -596,7 +597,7 @@ chown -R peertube:peertube \
 # We pass --max-old-space-size to give node enough heap for video
 # upload buffering; PeerTube's own docs recommend 1500 MiB on a
 # 2 GiB host.
-log "Starting PeerTube on $PT_HOSTNAME (loopback :9001)"
+log "Starting PeerTube on $PT_HOSTNAME (loopback :${PEERTUBE_PORT})"
 cd /app
 gosu peertube node --max-old-space-size=1500 dist/server &
 PEERTUBE_PID=$!
@@ -608,7 +609,7 @@ PEERTUBE_PID=$!
 # sees 502s and may give up before PeerTube has finished
 # its initial DB migrate + Sequelize sync (which can take
 # 30-60s on first boot).
-log "Waiting for PeerTube to listen on 127.0.0.1:9001"
+log "Waiting for PeerTube to listen on 127.0.0.1:${PEERTUBE_PORT}"
 PT_READY=0
 for _ in $(seq 1 120); do
     if ! kill -0 "$PEERTUBE_PID" 2>/dev/null; then
@@ -619,14 +620,14 @@ for _ in $(seq 1 120); do
     # /dev/tcp is a bash builtin: opens a TCP probe and exits 0
     # if the connect handshake completes. Avoids depending on
     # `nc` which isn't always installed.
-    if (echo > /dev/tcp/127.0.0.1/9001) 2>/dev/null; then
+    if (echo > /dev/tcp/127.0.0.1/$PEERTUBE_PORT) 2>/dev/null; then
         PT_READY=1
         break
     fi
     sleep 1
 done
 if [[ "$PT_READY" -ne 1 ]]; then
-    log "FATAL: PeerTube didn't bind 127.0.0.1:9001 within 120s"
+    log "FATAL: PeerTube didn't bind 127.0.0.1:${PEERTUBE_PORT} within 120s"
     early_exit_teardown
     exit 1
 fi
@@ -715,7 +716,6 @@ fi
 # `nobody`)?  Because we want to be able to swap user identity
 # in the future without coupling the two.  The cost of two
 # nobody processes is just two entries in /proc.
-log "Starting auth-proxy sidecar on :${AUTH_PROXY_LISTEN_PORT} -> Caddy :${CADDY_PORT}"
 
 # Make the admin-password file readable by the auth-proxy.  The
 # file is created by gen_secret() above with mode 0600 owned by
@@ -748,6 +748,24 @@ case "$PT_HTTPS:$PT_PORT" in
         ;;
 esac
 
+# Validate that OPENHOST_ROUTER_URL is set BEFORE launching the
+# auth-proxy.  The sidecar would refuse to start without it (and
+# emit a clear error to stderr), but our supervisor would then
+# log the generic "auth-proxy exited during startup" — which
+# misleads the operator into thinking the sidecar itself is at
+# fault.  Validate here so the failure message points at the
+# right environment variable.
+if [[ -z "${OPENHOST_ROUTER_URL:-}" ]]; then
+    log "FATAL: \$OPENHOST_ROUTER_URL is not set; auth-proxy needs it"
+    log "  to fetch the OpenHost router's JWKS for owner JWT verification."
+    log "  This variable is normally injected by OpenHost; if it isn't,"
+    log "  the openhost-core deployment is broken."
+    early_exit_teardown
+    exit 1
+fi
+
+log "Starting auth-proxy sidecar on :${AUTH_PROXY_LISTEN_PORT} -> Caddy :${CADDY_PORT}"
+
 AUTH_PROXY_LOG_LEVEL="${AUTH_PROXY_LOG_LEVEL:-INFO}" \
 AUTH_PROXY_LISTEN_PORT="$AUTH_PROXY_LISTEN_PORT" \
 AUTH_PROXY_UPSTREAM_HOST="127.0.0.1" \
@@ -757,7 +775,7 @@ AUTH_PROXY_PEERTUBE_PORT="$PEERTUBE_PORT" \
 AUTH_PROXY_CANONICAL_HOST="$CANONICAL_HOST" \
 AUTH_PROXY_ADMIN_USER="root" \
 AUTH_PROXY_ADMIN_PW_FILE="$ADMIN_PW_FILE" \
-OPENHOST_ROUTER_URL="${OPENHOST_ROUTER_URL:-}" \
+OPENHOST_ROUTER_URL="$OPENHOST_ROUTER_URL" \
     runuser -u nobody --preserve-environment -- \
         python3 /opt/openhost-peertube/auth_proxy.py &
 AUTH_PROXY_PID=$!

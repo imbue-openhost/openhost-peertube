@@ -10,12 +10,14 @@
 # proxy that accidentally exposes the local-loopback API to a
 # different vhost).
 #
-# The OpenHost router proxies via httpx and excludes the
-# original Host header, so by the time the request reaches
-# PeerTube the Host is `127.0.0.1:9000` — which never matches
-# the canonical hostname and trips the 403. The router does set
-# X-Forwarded-Host correctly, so we just have to rewrite Host
-# from that header before the request hits PeerTube.
+# Without rewriting, by the time a request reaches PeerTube the
+# Host header is some loopback variant (the OpenHost router and
+# the auth-proxy sidecar above us both forward to us by
+# 127.0.0.1:<their_upstream_port>) — which never matches the
+# canonical hostname and trips the 403. The OpenHost router DOES
+# set X-Forwarded-Host correctly, so we rewrite Host from that
+# header before the request hits PeerTube.  The auth-proxy
+# preserves X-Forwarded-Host on its way through.
 #
 # Topology:
 #

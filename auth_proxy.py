@@ -106,12 +106,25 @@ SSO_LOGOUT_PATH = f"{SSO_BASE}/logout"
 # yet-expired is the trigger.
 SSO_MARKER_COOKIE = "openhost_pt_sso_until"
 
-# When we mint a PeerTube token, peer-tube returns ``expires_in`` in
-# seconds (typically ~86400).  We refresh proactively when half the
-# token's life is gone — anchored to the actual expires_in returned
-# by PeerTube so a future change to PeerTube's token TTL doesn't
-# strand us.
-SSO_MIN_TOKEN_REMAINING_SEC = 60 * 60   # less than one hour left → re-mint
+# When we mint a PeerTube token, PeerTube returns ``expires_in`` in
+# seconds (typically ~86400).  We want the marker cookie to expire
+# BEFORE the access token so the next owner navigation re-trampolines
+# while there's still time left on the token (this avoids the SPA
+# ever seeing a 401 for a stale token).  The marker's lifetime is
+# computed as ``expires_in - SSO_MARKER_SAFETY_MARGIN_SEC``, capped
+# below by 60s (so a tiny TTL doesn't produce a negative or near-zero
+# marker that re-fires on every navigation).
+#
+# 1 hour of headroom means: with the typical 24h PeerTube token, the
+# marker lasts 23h and we re-mint shortly before expiry.  With a
+# hypothetical 30-minute token, headroom shrinks to 60s — still
+# correct, just less efficient.
+SSO_MARKER_SAFETY_MARGIN_SEC = 60 * 60
+
+# Short-lived marker we set on mint-failure paths so the browser
+# doesn't loop the trampoline if PeerTube is briefly unavailable.
+# After this many seconds the next owner navigation will retry.
+SSO_FAILURE_MARKER_SEC = 5 * 60
 
 # Maximum number of bytes to copy in a single chunk between client and
 # upstream.  64 KiB is comfortably below typical socket buffer sizes.
@@ -254,8 +267,9 @@ def _safe_next_path(raw: str) -> str:
         return "/"
     # Reject protocol-relative URLs and backslash-prefixed paths.
     # A path that starts with ``//`` (or ``/\\``) becomes a netloc
-    # reference per RFC 3986 §4.2.
-    if raw.startswith("//") or raw.startswith("/\\") or raw.startswith("/" + chr(0x5C)):
+    # reference per RFC 3986 §4.2.  ``"/\\"`` and ``"/" + chr(0x5C)``
+    # are the SAME 2-character string in Python — keep one.
+    if raw.startswith("//") or raw.startswith("/\\"):
         return "/"
     if not raw.startswith("/"):
         return "/"
@@ -265,7 +279,8 @@ def _safe_next_path(raw: str) -> str:
     # depth is cheap and protects against future browser quirks.
     try:
         parsed = urllib.parse.urlparse(raw)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        log.debug("urlparse failed for next path %r: %s", raw, exc)
         return "/"
     if parsed.scheme or parsed.netloc:
         return "/"
@@ -306,9 +321,24 @@ class JwksCache:
         with requests.get(url, timeout=5) as resp:
             resp.raise_for_status()
             jwks = resp.json()
+        # Defence in depth: a misbehaving router that returned a
+        # JSON array (or null) instead of an object would otherwise
+        # throw AttributeError on the .get() below.  Validate the
+        # shape and produce a clear error.
+        if not isinstance(jwks, dict):
+            raise RuntimeError(
+                f"router JWKS response is not a JSON object "
+                f"(got {type(jwks).__name__})"
+            )
+        keys_list = jwks.get("keys", [])
+        if not isinstance(keys_list, list):
+            raise RuntimeError(
+                f"router JWKS 'keys' field is not a list "
+                f"(got {type(keys_list).__name__})"
+            )
         keys = []
         skipped = 0
-        for jwk in jwks.get("keys", []):
+        for jwk in keys_list:
             try:
                 key = jwt.algorithms.RSAAlgorithm.from_jwk(jwk)
             except Exception as exc:  # noqa: BLE001
@@ -381,7 +411,11 @@ def _verify_owner(token: str, jwks: JwksCache) -> bool:
     except Exception as exc:  # noqa: BLE001
         log.warning("JWKS unavailable; denying owner check: %s", exc)
         return False
-    last_error: jwt.PyJWTError | None = None
+    last_error: Exception | None = None
+    # Sentinel ``False`` distinguishes "we never managed to decode the
+    # JWT against any key" from "we decoded successfully, but the sub
+    # was not 'owner'".  Without the sentinel, ``sub=None`` (a valid
+    # JWT with no sub claim) would log nothing at any level.
     decode_succeeded = False
     last_sub: str | None = None
     for key in keys:
@@ -392,7 +426,13 @@ def _verify_owner(token: str, jwks: JwksCache) -> bool:
                 algorithms=["RS256"],
                 options={"require": ["exp"], "verify_aud": False},
             )
-        except jwt.PyJWTError as exc:
+        except Exception as exc:  # noqa: BLE001
+            # Catch broader than ``jwt.PyJWTError`` because PyJWT
+            # CAN raise plain ``ValueError``/``TypeError``/
+            # ``UnicodeDecodeError`` for certain malformed token
+            # byte sequences before the JWT-specific validation
+            # logic runs.  Letting those propagate would tear down
+            # the request thread with no HTTP response.
             last_error = exc
             continue
         decode_succeeded = True
@@ -511,6 +551,13 @@ class PeerTubeOauthBridge:
         the client_id/secret are stale because PeerTube restarted),
         we transparently re-fetch the client creds and retry once.
         """
+        # Initialised to 0 so that even if the loop short-circuits in
+        # ways the type checker can't see, the post-loop ``raise`` has
+        # a defined value.  In practice, every code path through the
+        # ``with`` either ``return``s on 200, sets ``status_was_400``
+        # explicitly, or assigns ``failed_status`` — but a future
+        # refactor that adds a path could otherwise hit a NameError.
+        failed_status: int = 0
         for attempt in (0, 1):
             client_id, client_secret = self._fetch_client_creds(
                 force=(attempt == 1)
@@ -882,11 +929,14 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
         owner zone_auth.  Returns 5xx if PeerTube is unreachable or
         rejects our credentials.
 
-        Critically, this endpoint must reject requests on a federation
-        path or that lack zone_auth — otherwise an attacker could
-        request a token from a public surface.  We rely on the JWT
-        being signed by the router; without zone_auth and a valid
-        owner claim we always return 401.
+        Authorisation here is exclusively the zone_auth JWT.  No
+        path-based gating is needed because the trampoline path
+        ``/__openhost-sso/mint-token`` itself is dispatched in
+        ``_dispatch`` BEFORE any federation/anonymous bypass logic —
+        every reach to this method has already had its zone_auth
+        cookie inspected by the dispatcher.  We re-verify the JWT
+        here as defence in depth (so a future refactor of
+        ``_dispatch`` can't accidentally expose this endpoint).
         """
         # Strip request body — POST etc. has no business here, this
         # is GET-only.
@@ -911,7 +961,20 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
             tokens = self.oauth_bridge.mint_token()
         except Exception as exc:  # noqa: BLE001
             log.warning("PeerTube token mint failed: %s", exc)
-            self._sso_json_response(502, {"error": "mint_failed"})
+            # Set a SHORT-lived failure marker so the browser
+            # doesn't ping-pong through the trampoline if PeerTube
+            # is briefly unavailable.  The marker's value is just a
+            # timestamp; the sidecar uses ``_marker_cookie_valid``
+            # which only cares that the value is in the future, so
+            # we don't need a separate "this is a failure marker"
+            # type.  After SSO_FAILURE_MARKER_SEC the trampoline
+            # will retry naturally.
+            failure_until = int(time.time() + SSO_FAILURE_MARKER_SEC)
+            self._sso_json_response(
+                502,
+                {"error": "mint_failed"},
+                marker_until=failure_until,
+            )
             return
 
         # Minimal sanity-check.  PeerTube always returns these keys
@@ -922,40 +985,20 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                 self._sso_json_response(502, {"error": "mint_malformed"})
                 return
 
-        # Compute the marker-cookie expiry.  We mint a fresh marker
-        # at half the token's life so the next visit re-mints when
-        # the token has half its life left — far before the SPA
-        # gets a 401 from a stale token.
+        # Compute the marker-cookie expiry.  The marker MUST expire
+        # before the access token does — otherwise an owner whose
+        # marker is still valid when their token has expired will
+        # skip the trampoline and the SPA's localStorage tokens are
+        # stale.  We bake in SSO_MARKER_SAFETY_MARGIN_SEC of
+        # headroom: marker_until = now + expires_in - margin.  For
+        # the typical 24h PeerTube token, the marker lasts 23h.
         expires_in = int(tokens.get("expires_in") or 86400)
-        marker_until = int(time.time() + max(SSO_MIN_TOKEN_REMAINING_SEC,
-                                             expires_in // 2))
+        marker_lifetime = max(60, expires_in - SSO_MARKER_SAFETY_MARGIN_SEC)
+        marker_until = int(time.time() + marker_lifetime)
 
-        # Build the marker cookie.  Attributes:
-        #   * Path=/ so it's sent on every same-origin request
-        #     (the auth-proxy needs to read it on every navigation).
-        #   * SameSite=Lax: the trampoline only fires on top-level
-        #     navigations, never on cross-site iframes/forms.
-        #   * Secure when the connection is actually HTTPS (in
-        #     production it always is — the OpenHost router fronts
-        #     us with TLS — but in local dev / lvh.me deployments
-        #     the request reaches us as HTTP, and a Secure cookie
-        #     would be silently dropped by the browser, sending us
-        #     into a re-trampoline loop).
-        #   * HttpOnly is OMITTED on purpose: the cookie is a
-        #     "skip the trampoline next time" marker; it carries
-        #     no privilege.  A client-side script could
-        #     legitimately want to know whether SSO is active.
-        xfp = self.headers.get("X-Forwarded-Proto", "").lower()
-        is_https = "https" in xfp
-        cookie_attrs = [
-            f"{SSO_MARKER_COOKIE}={marker_until}",
-            f"Max-Age={max(0, marker_until - int(time.time()))}",
-            "Path=/",
-            "SameSite=Lax",
-        ]
-        if is_https:
-            cookie_attrs.append("Secure")
-        cookie_value = "; ".join(cookie_attrs)
+        # Build the marker cookie.  Attributes documented in
+        # ``_build_marker_cookie``.
+        cookie_value = self._build_marker_cookie(marker_until)
 
         body_bytes = json.dumps({
             "access_token": tokens["access_token"],
@@ -986,45 +1029,79 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
         the trampoline on the next owner visit, which in turn will
         replace the stale localStorage tokens.
         """
-        # Match the cookie attributes from _handle_sso_mint_token
-        # so the unset Set-Cookie addresses the same cookie scope:
-        # Path=/, SameSite=Lax, and Secure when we're on HTTPS.  A
-        # mismatched attribute set can leave the browser holding
-        # onto the original cookie because it treats the unset as
-        # a different cookie.
-        xfp = self.headers.get("X-Forwarded-Proto", "").lower()
-        is_https = "https" in xfp
-        clear_attrs = [
-            f"{SSO_MARKER_COOKIE}=",
-            "Max-Age=0",
-            "Path=/",
-            "SameSite=Lax",
-        ]
-        if is_https:
-            clear_attrs.append("Secure")
+        # ``_build_marker_cookie`` already gates ``Secure`` on
+        # ``X-Forwarded-Proto`` so the unset Set-Cookie addresses
+        # the same cookie scope as the original.  A mismatched
+        # attribute set can leave the browser holding onto the
+        # original cookie because it treats the unset as a
+        # different cookie.  Pass marker_until=0 so the value and
+        # Max-Age both expire immediately.
+        unset_cookie = self._build_marker_cookie(0)
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", "0")
-            self.send_header("Set-Cookie", "; ".join(clear_attrs))
+            self.send_header("Set-Cookie", unset_cookie)
             self.send_header("Cache-Control", "no-store")
             self.send_header("Connection", "close")
             self.end_headers()
         except OSError as exc:
             log.debug("client disconnected mid-SSO logout: %s", exc)
 
-    def _sso_json_response(self, code: int, body: dict) -> None:
+    def _sso_json_response(
+        self,
+        code: int,
+        body: dict,
+        marker_until: int | None = None,
+    ) -> None:
+        """Send a JSON response from a sidecar SSO endpoint.
+
+        Honours HEAD per RFC 9110 §9.3.2 by skipping the body write
+        but keeping the Content-Length so the client knows the size
+        a GET would have returned.
+
+        ``marker_until`` optionally sets the SSO marker cookie to
+        the given unix timestamp.  Used by the mint-failure path to
+        prevent a redirect loop when PeerTube is briefly unavailable.
+        """
         body_bytes = json.dumps(body).encode("utf-8")
         try:
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body_bytes)))
             self.send_header("Cache-Control", "no-store, max-age=0")
+            if marker_until is not None:
+                self.send_header(
+                    "Set-Cookie",
+                    self._build_marker_cookie(marker_until),
+                )
             self.send_header("Connection", "close")
             self.end_headers()
-            self.wfile.write(body_bytes)
+            if self.command != "HEAD":
+                self.wfile.write(body_bytes)
         except OSError as exc:
             log.debug("client disconnected mid-SSO error response: %s", exc)
+
+    def _build_marker_cookie(self, marker_until: int) -> str:
+        """Build the marker-cookie ``Set-Cookie`` header value.
+
+        Centralises the cookie-attribute construction so the mint,
+        logout, and failure paths all stay in sync.  ``Secure`` is
+        added only on HTTPS — see the inline comment in
+        ``_handle_sso_mint_token`` for why.
+        """
+        xfp = self.headers.get("X-Forwarded-Proto", "").lower()
+        is_https = "https" in xfp
+        max_age = max(0, marker_until - int(time.time()))
+        attrs = [
+            f"{SSO_MARKER_COOKIE}={marker_until}",
+            f"Max-Age={max_age}",
+            "Path=/",
+            "SameSite=Lax",
+        ]
+        if is_https:
+            attrs.append("Secure")
+        return "; ".join(attrs)
 
     # ----------------------------------------------------------------
     # Pass-through proxy
@@ -1279,11 +1356,14 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
             except OSError:
                 pass
 
+        # Construct + register inside the try so a register failure
+        # (already-closed socket) still hits the finally and closes
+        # the selector — otherwise the selector's epoll/kqueue FD
+        # would leak.
         sel = selectors.DefaultSelector()
-        sel.register(client_sock, selectors.EVENT_READ, "client")
-        sel.register(upstream_sock, selectors.EVENT_READ, "upstream")
-
         try:
+            sel.register(client_sock, selectors.EVENT_READ, "client")
+            sel.register(upstream_sock, selectors.EVENT_READ, "upstream")
             while True:
                 events = sel.select(timeout=STREAM_TIMEOUT_SECONDS)
                 if not events:

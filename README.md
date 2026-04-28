@@ -96,12 +96,16 @@ all owned by the same login.
   not); only the JSON token endpoint enforces JWT validity. This
   means a non-owner who somehow lands on the trampoline gets a
   graceful 401 + anonymous bounce-through, not an oracle.
-* The marker cookie is `Secure; SameSite=Lax; Path=/`. It carries
-  no privilege — it just opts the next visit out of the trampoline
-  redirect. A forged cookie with `openhost_pt_sso_until=99999999999`
-  causes the sidecar to skip the trampoline, but skipping means
-  "leave the request alone" — the request is then anonymous to
-  PeerTube unless the browser has the actual token in localStorage.
+* The marker cookie is `SameSite=Lax; Path=/`, plus `Secure` when
+  the connection arrived over HTTPS (always true on the OpenHost
+  router; the sidecar omits `Secure` in dev / `lvh.me` setups so
+  browsers don't silently drop a Secure cookie over plain HTTP
+  and re-trigger the trampoline). It carries no privilege — it
+  just opts the next visit out of the trampoline redirect. A
+  forged cookie with `openhost_pt_sso_until=99999999999` causes
+  the sidecar to skip the trampoline, but skipping means "leave
+  the request alone" — the request is then anonymous to PeerTube
+  unless the browser has the actual token in localStorage.
 
 ### Why Caddy is still in the path
 

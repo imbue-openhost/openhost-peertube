@@ -94,9 +94,11 @@ COPY auth_proxy.py /opt/openhost-peertube/auth_proxy.py
 RUN chmod +x /opt/openhost-peertube/start.sh
 
 # OpenHost will route http://peertube.<zone>/... to this port.
-# Caddy (the host-rewriter front-door) binds :9000; PeerTube
-# itself listens on the loopback at :9001. See Caddyfile and
-# the start.sh /config/local.yaml override.
+# The auth-proxy sidecar (auth_proxy.py) binds :9000.  Behind it,
+# Caddy on loopback :9090 rewrites the Host header for the SPA's
+# canonical-Host check, and PeerTube itself listens on loopback
+# :9001.  See auth_proxy.py module docstring + Caddyfile + the
+# start.sh /config/local.yaml override.
 EXPOSE 9000
 
 # ENTRYPOINT inherited from the base image is the upstream
