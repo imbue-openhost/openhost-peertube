@@ -730,10 +730,27 @@ chmod 640 "$ADMIN_PW_FILE"
 # from `nobody` lists their names but reads fail.
 chmod 711 "$SECRETS_DIR"
 
+# Construct the canonical Host header value PeerTube enforces on
+# /api/v1/oauth-clients/local — that's webserver.hostname plus the
+# port if it's non-default for the scheme (HTTPS != 443, HTTP != 80).
+# The bridge needs this to talk to PeerTube directly (loopback)
+# without bouncing through Caddy.
+case "$PT_HTTPS:$PT_PORT" in
+    true:443|false:80)
+        CANONICAL_HOST="$PT_HOSTNAME"
+        ;;
+    *)
+        CANONICAL_HOST="$PT_HOSTNAME:$PT_PORT"
+        ;;
+esac
+
 AUTH_PROXY_LOG_LEVEL="${AUTH_PROXY_LOG_LEVEL:-INFO}" \
 AUTH_PROXY_LISTEN_PORT="$AUTH_PROXY_LISTEN_PORT" \
 AUTH_PROXY_UPSTREAM_HOST="127.0.0.1" \
 AUTH_PROXY_UPSTREAM_PORT="$CADDY_PORT" \
+AUTH_PROXY_PEERTUBE_HOST="127.0.0.1" \
+AUTH_PROXY_PEERTUBE_PORT="$PEERTUBE_PORT" \
+AUTH_PROXY_CANONICAL_HOST="$CANONICAL_HOST" \
 AUTH_PROXY_ADMIN_USER="root" \
 AUTH_PROXY_ADMIN_PW_FILE="$ADMIN_PW_FILE" \
 OPENHOST_ROUTER_URL="${OPENHOST_ROUTER_URL:-}" \

@@ -378,13 +378,22 @@ class PeerTubeOauthBridge:
            returns {"access_token": "...", "refresh_token": "...",
                     "token_type": "Bearer", "expires_in": 86400, ...}.
 
-    We do both steps from the sidecar over loopback to PeerTube on
-    UPSTREAM_HOST:UPSTREAM_PORT, using ``admin-password.txt`` as
-    the password.  We DO NOT cache the access token globally; we
-    mint a fresh one each time the trampoline fires for an owner
-    visit, and let the SPA's localStorage be the per-browser cache.
-    PeerTube tokens are short enough (~24h) and minting is cheap
-    (~50ms loopback), so the simplicity is worth it.
+    Both calls go DIRECTLY to PeerTube on PEERTUBE_HOST:PEERTUBE_PORT
+    — they bypass the Caddy mid-tier.  This is necessary because
+    PeerTube's ``/api/v1/oauth-clients/local`` handler requires the
+    inbound Host header to match the canonical webserver.hostname
+    EXACTLY: any other value (including ``127.0.0.1:9090`` which
+    Caddy would forward without an X-Forwarded-Host to rewrite from)
+    returns 403.  The bridge has the canonical hostname available
+    (it's in the env via $PEERTUBE_WEBSERVER_HOSTNAME, surfaced as
+    ``canonical_host`` in our constructor), so we just send it
+    directly.
+
+    We DO NOT cache the access token globally; we mint a fresh one
+    each time the trampoline fires for an owner visit, and let the
+    SPA's localStorage be the per-browser cache.  PeerTube tokens
+    are short enough (~24h) and minting is cheap (~50ms loopback),
+    so the simplicity is worth it.
 
     Client_id / client_secret are cached because they don't change
     until PeerTube restarts.  We refresh them on any token-mint
@@ -393,28 +402,45 @@ class PeerTubeOauthBridge:
 
     def __init__(
         self,
-        upstream_host: str,
-        upstream_port: int,
+        peertube_host: str,
+        peertube_port: int,
+        canonical_host: str,
         username: str,
         password: str,
     ) -> None:
-        self._upstream_host = upstream_host
-        self._upstream_port = upstream_port
+        self._peertube_host = peertube_host
+        self._peertube_port = peertube_port
+        # The canonical Host header value PeerTube expects on its
+        # ``/api/v1/oauth-clients/local`` endpoint.  Includes the
+        # explicit port only when the public URL has a non-standard
+        # one (PeerTube formats this as ``host`` for :443/HTTPS,
+        # ``host:port`` otherwise).  We honor the value passed by
+        # start.sh verbatim — it's authoritative.
+        self._canonical_host = canonical_host
         self._username = username
         self._password = password
         self._client_id: str | None = None
         self._client_secret: str | None = None
         self._client_lock = threading.Lock()
 
-    def _upstream(self, path: str) -> str:
-        return f"http://{self._upstream_host}:{self._upstream_port}{path}"
+    def _peertube_url(self, path: str) -> str:
+        return f"http://{self._peertube_host}:{self._peertube_port}{path}"
+
+    def _request_headers(self) -> dict[str, str]:
+        # Override the Host header so PeerTube's canonical-Host
+        # check passes.  Python's requests honors a Host header in
+        # the user-supplied dict (it passes through to urllib3 which
+        # passes through to http.client).
+        return {"Host": self._canonical_host}
 
     def _fetch_client_creds(self, force: bool = False) -> tuple[str, str]:
         with self._client_lock:
             if not force and self._client_id and self._client_secret:
                 return self._client_id, self._client_secret
-            url = self._upstream("/api/v1/oauth-clients/local")
-            with requests.get(url, timeout=10) as resp:
+            url = self._peertube_url("/api/v1/oauth-clients/local")
+            with requests.get(
+                url, headers=self._request_headers(), timeout=10
+            ) as resp:
                 resp.raise_for_status()
                 data = resp.json()
             cid = data.get("client_id")
@@ -439,8 +465,10 @@ class PeerTubeOauthBridge:
         we transparently re-fetch the client creds and retry once.
         """
         for attempt in (0, 1):
-            client_id, client_secret = self._fetch_client_creds(force=(attempt == 1))
-            url = self._upstream("/api/v1/users/token")
+            client_id, client_secret = self._fetch_client_creds(
+                force=(attempt == 1)
+            )
+            url = self._peertube_url("/api/v1/users/token")
             data = {
                 "client_id": client_id,
                 "client_secret": client_secret,
@@ -449,14 +477,19 @@ class PeerTubeOauthBridge:
                 "username": self._username,
                 "password": self._password,
             }
-            resp = requests.post(url, data=data, timeout=10)
+            resp = requests.post(
+                url,
+                data=data,
+                headers=self._request_headers(),
+                timeout=10,
+            )
             if resp.status_code == 200:
                 return resp.json()
             if resp.status_code == 400 and attempt == 0:
                 # Likely stale client creds.  Force-refresh on next
                 # attempt.
                 log.info(
-                    "PeerTube token mint got 400; refreshing client creds and retrying"
+                    "PeerTube token mint got 400; refreshing client creds"
                 )
                 continue
             # Any other status, or 400 on the second attempt, is fatal
@@ -1443,10 +1476,19 @@ def main() -> int:
 
     try:
         listen_port = _port_from_env("AUTH_PROXY_LISTEN_PORT", 9000)
-        # AUTH_PROXY_UPSTREAM_PORT is the port Caddy listens on
-        # (Caddy is what does Host-header rewriting before forwarding
-        # to PeerTube).  See start.sh.
+        # AUTH_PROXY_UPSTREAM_PORT is the port Caddy listens on (Caddy
+        # is the Host-rewriter that fronts PeerTube).  Pass-through
+        # proxy traffic flows AUTH_PROXY → Caddy → PeerTube.
         upstream_port = _port_from_env("AUTH_PROXY_UPSTREAM_PORT", 9090)
+        # AUTH_PROXY_PEERTUBE_PORT is where PeerTube itself listens
+        # on the loopback.  The OAuth bridge bypasses Caddy and
+        # speaks to PeerTube directly because PeerTube's
+        # /api/v1/oauth-clients/local handler enforces a strict
+        # Host-header equality check that's awkward to satisfy
+        # through the Caddy mid-tier when there's no inbound
+        # X-Forwarded-Host to rewrite from (loopback callers don't
+        # have one).
+        peertube_port = _port_from_env("AUTH_PROXY_PEERTUBE_PORT", 9001)
     except ValueError as exc:
         log.error("invalid port configuration: %s", exc)
         return 1
@@ -1454,6 +1496,24 @@ def main() -> int:
     upstream_host = os.environ.get(
         "AUTH_PROXY_UPSTREAM_HOST", "127.0.0.1"
     ).strip() or "127.0.0.1"
+    peertube_host = os.environ.get(
+        "AUTH_PROXY_PEERTUBE_HOST", "127.0.0.1"
+    ).strip() or "127.0.0.1"
+
+    # The canonical PeerTube hostname (and explicit :port if the
+    # public URL has a non-standard one) — what PeerTube expects on
+    # the Host header when it's checking ``oauth-clients/local``.
+    # start.sh derives this from PEERTUBE_WEBSERVER_HOSTNAME +
+    # PEERTUBE_WEBSERVER_PORT and passes it via env.
+    canonical_host = os.environ.get(
+        "AUTH_PROXY_CANONICAL_HOST", ""
+    ).strip()
+    if not canonical_host:
+        log.error(
+            "AUTH_PROXY_CANONICAL_HOST is not set; refusing to start "
+            "(should be PEERTUBE_WEBSERVER_HOSTNAME[:port])"
+        )
+        return 1
 
     admin_user = os.environ.get(
         "AUTH_PROXY_ADMIN_USER", "root"
@@ -1478,8 +1538,9 @@ def main() -> int:
     jwks.prefetch()
 
     bridge = PeerTubeOauthBridge(
-        upstream_host=upstream_host,
-        upstream_port=upstream_port,
+        peertube_host=peertube_host,
+        peertube_port=peertube_port,
+        canonical_host=canonical_host,
         username=admin_user,
         password=admin_pw,
     )
@@ -1499,8 +1560,10 @@ def main() -> int:
         return 1
 
     log.info(
-        "listening on 0.0.0.0:%d -> %s:%d (router=%s, admin_user=%s)",
+        "listening on 0.0.0.0:%d -> %s:%d (router=%s, admin_user=%s, "
+        "canonical_host=%s, peertube=%s:%d)",
         listen_port, upstream_host, upstream_port, router_url, admin_user,
+        canonical_host, peertube_host, peertube_port,
     )
     try:
         server.serve_forever()
