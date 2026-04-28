@@ -623,9 +623,11 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
         target = SSO_BOUNCE_PATH + "?" + urllib.parse.urlencode({"next": next_url})
         # The marker's expiry timestamp is used by
         # ``_build_marker_cookie`` to compute the ``Max-Age``
-        # attribute and (for backwards-compatibility with operators
-        # who debug via cookie inspection) is also embedded in the
-        # cookie value.  The dispatch-layer presence check
+        # attribute, and is also written verbatim as the cookie
+        # value for human debuggability — an operator inspecting
+        # the cookie in their browser dev tools can read off when
+        # the marker will expire instead of having to compute it
+        # from Max-Age.  The dispatch-layer presence check
         # (``SSO_MARKER_COOKIE in cookies``) ignores the value
         # entirely; only Max-Age governs when the browser stops
         # sending it.

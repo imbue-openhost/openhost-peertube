@@ -805,84 +805,69 @@ print(node)
 ' "$label" "$@"
 }
 
-# Helper: GET a JSON endpoint and capture the body + HTTP status.
-# Wraps curl so a non-2xx response surfaces as a clean operator
-# message (with the response body for diagnosis) instead of
-# letting set -e abort the script with no context, AND so a
-# transport failure (refused connect, DNS failure, timeout)
-# triggers early_exit_teardown rather than orphaning the rest
-# of the supervised children.
+# HTTP helper: send a request to PeerTube on the loopback,
+# capture the body + status code, and surface non-2xx / transport
+# failures as clean FATAL log lines (returning 1) instead of
+# letting ``set -e`` abort the script with no context and orphan
+# the rest of the supervised children.
 #
-# Usage:  body=$(http_get_json "<label>" "<auth-bearer-or-empty>" "<url>")
-#         "$body" is set, function returns 1 on failure, caller
-#         is expected to early_exit_teardown + exit on non-zero.
-http_get_json() {
-    local label="$1" bearer="$2" url="$3"
-    local raw code body
-    local -a curl_args=(curl -sS -w '\n%{http_code}' -H "Host: $CANONICAL_HOST")
+# Usage:
+#     body=$(_pt_curl <label> <method> <bearer-or-empty> <url> \
+#                     <ok-codes> [<content-type>] [<body>])
+#
+#  * ``label``        — short identifier for the FATAL log line.
+#  * ``method``       — HTTP method (GET/POST/PUT/DELETE...).
+#  * ``bearer``       — empty string or the OAuth access token.
+#  * ``url``          — full URL.
+#  * ``ok-codes``     — space-separated HTTP codes treated as
+#                       success.  Anything else is a FATAL.
+#  * ``content-type`` — optional; required for methods with bodies.
+#  * ``body``         — optional request body, fed to curl on
+#                       stdin via ``--data-binary @-`` so the
+#                       value never lands in argv (and therefore
+#                       /proc/<pid>/cmdline).
+#
+# stderr is left attached to the parent's stderr (curl with -sS
+# emits transport-error diagnostics there); we deliberately do
+# NOT merge stderr into the captured stdout because doing so
+# could let a curl warning printed AFTER the HTTP body throw
+# off the response splitter, which extracts the HTTP code as
+# the LAST line of stdout.  Transport failures still surface
+# via curl's non-zero exit code, which we check.
+_pt_curl() {
+    local label="$1" method="$2" bearer="$3" url="$4" ok_codes="$5"
+    local content_type="${6:-}"
+    local body="${7-}"
+
+    local -a curl_args=(curl -sS -w '\n%{http_code}'
+        -X "$method"
+        -H "Host: $CANONICAL_HOST")
     if [[ -n "$bearer" ]]; then
         curl_args+=(-H "Authorization: Bearer $bearer")
+    fi
+    if [[ -n "$content_type" ]]; then
+        curl_args+=(-H "Content-Type: $content_type")
+    fi
+    if [[ $# -ge 7 ]]; then
+        curl_args+=(--data-binary @-)
     fi
     curl_args+=("$url")
-    if ! raw=$("${curl_args[@]}" 2>&1); then
-        log "FATAL: $label: curl transport failure: $raw"
-        return 1
-    fi
-    code="${raw##*$'\n'}"
-    body="${raw%$'\n'*}"
-    if [[ "$code" != "200" ]]; then
-        log "FATAL: $label: HTTP $code: $body"
-        return 1
-    fi
-    printf '%s' "$body"
-}
 
-# POST a urlencoded body via stdin.  Same error contract as
-# http_get_json above.
-http_post_urlencoded_json() {
-    local label="$1" bearer="$2" url="$3" body="$4"
     local raw code resp
-    local -a curl_args=(curl -sS -w '\n%{http_code}'
-        -H "Host: $CANONICAL_HOST"
-        -H "Content-Type: application/x-www-form-urlencoded")
-    if [[ -n "$bearer" ]]; then
-        curl_args+=(-H "Authorization: Bearer $bearer")
-    fi
-    curl_args+=(--data-binary @- "$url")
-    if ! raw=$(printf '%s' "$body" | "${curl_args[@]}" 2>&1); then
-        log "FATAL: $label: curl transport failure: $raw"
-        return 1
+    if [[ $# -ge 7 ]]; then
+        raw=$(printf '%s' "$body" | "${curl_args[@]}") || {
+            log "FATAL: $label: curl transport failure (exit $?)"
+            return 1
+        }
+    else
+        raw=$("${curl_args[@]}") || {
+            log "FATAL: $label: curl transport failure (exit $?)"
+            return 1
+        }
     fi
     code="${raw##*$'\n'}"
     resp="${raw%$'\n'*}"
-    if [[ "$code" != "200" ]]; then
-        log "FATAL: $label: HTTP $code: $resp"
-        return 1
-    fi
-    printf '%s' "$resp"
-}
 
-# POST/PUT a JSON body.  Body is an already-formatted JSON string
-# passed via --data-binary so it doesn't go through argv.
-# ``method`` is GET/POST/PUT (curl -X).  ``ok_codes`` is a space-
-# separated list of HTTP codes the caller treats as success;
-# anything else is a FATAL.
-http_send_json() {
-    local label="$1" method="$2" bearer="$3" url="$4" body="$5" ok_codes="$6"
-    local raw code resp
-    local -a curl_args=(curl -sS -w '\n%{http_code}' -X "$method"
-        -H "Host: $CANONICAL_HOST"
-        -H "Content-Type: application/json")
-    if [[ -n "$bearer" ]]; then
-        curl_args+=(-H "Authorization: Bearer $bearer")
-    fi
-    curl_args+=(--data-binary @- "$url")
-    if ! raw=$(printf '%s' "$body" | "${curl_args[@]}" 2>&1); then
-        log "FATAL: $label: curl transport failure: $raw"
-        return 1
-    fi
-    code="${raw##*$'\n'}"
-    resp="${raw%$'\n'*}"
     local matched=0
     for ok in $ok_codes; do
         if [[ "$code" == "$ok" ]]; then matched=1; break; fi
@@ -899,7 +884,8 @@ http_send_json() {
 # the SAME response; a per-parse curl invocation could race a
 # client-creds rotation (rare but possible — PeerTube rotates
 # the local client creds across restarts).
-OAUTH_CLIENT_JSON=$(http_get_json "oauth-clients.local" "" "$PT_LOOPBACK/api/v1/oauth-clients/local") || {
+OAUTH_CLIENT_JSON=$(_pt_curl "oauth-clients.local" GET "" \
+    "$PT_LOOPBACK/api/v1/oauth-clients/local" "200") || {
     early_exit_teardown
     exit 1
 }
@@ -930,13 +916,23 @@ PT_CLIENT_SECRET=$(printf '%s' "$OAUTH_CLIENT_JSON" | parse_json_field oauth-cli
 #  * a future change to gen_secret() that enables a different
 #    alphabet must NOT silently break this code path.
 url_encode() {
-    python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
+    # Pass the secret via env var rather than argv so it never
+    # appears in /proc/<pid>/cmdline for the duration of the
+    # python3 process (visible to anyone with read access to
+    # the procfs entry).  Same defensive pattern as the rest
+    # of the file uses for password-bearing commands.
+    URL_ENCODE_INPUT="$1" python3 -c '
+import os, urllib.parse
+print(urllib.parse.quote(os.environ["URL_ENCODE_INPUT"], safe=""))
+'
 }
 TOKEN_BODY=$(printf 'client_id=%s&client_secret=%s&grant_type=password&response_type=code&username=root&password=%s' \
     "$(url_encode "$PT_CLIENT_ID")" \
     "$(url_encode "$PT_CLIENT_SECRET")" \
     "$(url_encode "$PT_ADMIN_PW")")
-TOKEN_JSON=$(http_post_urlencoded_json "users.token" "" "$PT_LOOPBACK/api/v1/users/token" "$TOKEN_BODY") || {
+TOKEN_JSON=$(_pt_curl "users.token" POST "" \
+    "$PT_LOOPBACK/api/v1/users/token" "200" \
+    "application/x-www-form-urlencoded" "$TOKEN_BODY") || {
     early_exit_teardown
     exit 1
 }
@@ -954,7 +950,8 @@ PT_ACCESS_TOKEN=$(printf '%s' "$TOKEN_JSON" | parse_json_field users.token acces
 # prepended, but the API returns the short form in the ``name``
 # field).  This check is correct on first boot AND on a
 # re-deploy after a previous remove.
-PLUGIN_LIST_JSON=$(http_get_json "plugins.list" "$PT_ACCESS_TOKEN" "$PT_LOOPBACK/api/v1/plugins?count=100") || {
+PLUGIN_LIST_JSON=$(_pt_curl "plugins.list" GET "$PT_ACCESS_TOKEN" \
+    "$PT_LOOPBACK/api/v1/plugins?count=100" "200") || {
     early_exit_teardown
     exit 1
 }
@@ -978,10 +975,10 @@ if [[ "$INSTALLED" == "yes" ]]; then
 else
     log "Installing plugin auth-openhost-sso from $PLUGIN_DIR"
     INSTALL_PAYLOAD=$(python3 -c 'import json,os; print(json.dumps({"path": os.environ["PLUGIN_DIR"]}))')
-    http_send_json "plugins.install" POST "$PT_ACCESS_TOKEN" \
+    _pt_curl "plugins.install" POST "$PT_ACCESS_TOKEN" \
         "$PT_LOOPBACK/api/v1/plugins/install" \
-        "$INSTALL_PAYLOAD" \
-        "200 204" >/dev/null || {
+        "200 204" \
+        "application/json" "$INSTALL_PAYLOAD" >/dev/null || {
         early_exit_teardown
         exit 1
     }
@@ -997,10 +994,10 @@ fi
 # us.
 log "Configuring plugin (router URL: $OPENHOST_ROUTER_URL)"
 SETTINGS_PAYLOAD=$(python3 -c "import json,os; print(json.dumps({'settings': {'openhost-router-url': os.environ['OPENHOST_ROUTER_URL']}}))")
-http_send_json "plugins.settings" PUT "$PT_ACCESS_TOKEN" \
+_pt_curl "plugins.settings" PUT "$PT_ACCESS_TOKEN" \
     "$PT_LOOPBACK/api/v1/plugins/$PLUGIN_NPM_NAME/settings" \
-    "$SETTINGS_PAYLOAD" \
-    "204" >/dev/null || {
+    "204" \
+    "application/json" "$SETTINGS_PAYLOAD" >/dev/null || {
     early_exit_teardown
     exit 1
 }
@@ -1021,8 +1018,7 @@ http_send_json "plugins.settings" PUT "$PT_ACCESS_TOKEN" \
 #     via PeerTube's native flow.
 #
 # Runs as a dedicated ``openhost-authproxy`` user (not ``nobody``
-# and not the same user as Caddy).  Least-privilege: even though
-# the sidecar no longer holds the admin password, isolating
+# and not the same user as Caddy).  Least-privilege: isolating
 # every container daemon to its own UID means a compromise of
 # any one process can't read another's data files.
 

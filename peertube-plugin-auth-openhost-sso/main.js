@@ -284,7 +284,25 @@ module.exports = { register, unregister }
 // Settings handling
 // ----------------------------------------------------------------
 
-async function loadRouterSetting (settingsManager) {
+// Serialise concurrent loadRouterSetting calls.  PeerTube's
+// settings-change subscription can fire in rapid succession (e.g.
+// when the admin saves multiple settings in one PUT), and two
+// in-flight calls suspended at ``await getSetting`` would both
+// resume past the guard, both call ``releaseJwks`` on each
+// other's freshly-built clients, and end up with a non-deterministic
+// last-writer-wins.  We chain each invocation behind the
+// previous one's promise so the URL-comparison guard sees a
+// stable view of ``store.routerUrl`` / ``store.jwks``.
+let pendingSettingsLoad = Promise.resolve()
+function loadRouterSetting (settingsManager) {
+  const next = pendingSettingsLoad
+    .catch(() => undefined)
+    .then(() => loadRouterSettingInner(settingsManager))
+  pendingSettingsLoad = next
+  return next
+}
+
+async function loadRouterSettingInner (settingsManager) {
   const value = (await settingsManager.getSetting('openhost-router-url')) || ''
   const trimmed = value.trim()
   if (!trimmed) {
