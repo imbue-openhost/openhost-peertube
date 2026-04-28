@@ -504,7 +504,17 @@ async function handleAuthRequest (req, res) {
       username: 'openhost',
       email,
       role: 0,
-      displayName: 'OpenHost Owner'
+      displayName: 'owner',
+      // Without a userUpdater, PeerTube's updateUserFromExternal
+      // is a no-op and the displayName / role / email we pass
+      // here only get applied on first user creation.  Provide
+      // an updater that always returns the value we just supplied
+      // so an existing ``openhost`` user has its account fields
+      // brought into line with the current plugin policy on every
+      // sign-in (e.g. so changing the default displayName here
+      // takes effect for users created by an earlier plugin
+      // version).
+      userUpdater: ({ newValue }) => newValue
     })
   } catch (err) {
     logger.error('auth-openhost-sso: userAuthenticated call failed', { err })
