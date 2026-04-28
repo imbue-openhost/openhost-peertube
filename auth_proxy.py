@@ -24,9 +24,21 @@ from ``localStorage`` rather than a cookie.
          /api/v1/oauth-clients/local + /api/v1/users/token API,
          using the persisted ``admin-password.txt`` as a
          service-account credential just on the loopback);
-       * writes ``access_token``, ``refresh_token``, ``token_type``
-         to localStorage — the exact keys the PeerTube SPA reads
-         (see /app/client/src/root-helpers/users/oauth-user-tokens.ts).
+       * writes seven items to localStorage:
+              - the OAuth token triple (``access_token``,
+                ``refresh_token``, ``token_type``); and
+              - the four user-identity fields (``id``, ``username``,
+                ``email``, ``role``) — without these the SPA
+                bootstrap (``loadUser`` in ``main.js``) treats the
+                visitor as anonymous EVEN with valid tokens.
+          These are the exact keys the PeerTube SPA reads on
+          bootstrap (see
+          /app/client/src/root-helpers/users/oauth-user-tokens.ts
+          for the token triple and the SPA's
+          user-local-storage-keys helpers for the identity quartet).
+          The sidecar fetches the identity fields via
+          ``/api/v1/users/me`` with the freshly-minted token before
+          handing them to the trampoline.
    The mint-token response from the sidecar additionally carries
    a ``Set-Cookie: openhost_pt_sso_until=<unix-ts>; Path=/; ...``
    header so subsequent visits skip the trampoline until the
@@ -1048,10 +1060,18 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
     def _handle_sso_mint_token(self) -> None:
         """Internal endpoint that mints a PeerTube token for the owner.
 
-        Returns JSON {access_token, refresh_token, token_type, expires_in}
-        on success.  Returns 401 if the request doesn't carry a valid
-        owner zone_auth.  Returns 5xx if PeerTube is unreachable or
-        rejects our credentials.
+        Returns JSON
+        ``{access_token, refresh_token, token_type, expires_in,
+           user: {id, username, email, role_id}}`` on success.  The
+        ``user`` block is what the trampoline JS writes to
+        localStorage so the SPA's bootstrap recognises the visitor
+        as logged in (without it the SPA boots anonymous even with
+        valid tokens).  The identity fields come from
+        ``/api/v1/users/me`` called with the freshly-minted token.
+
+        Returns 401 if the request doesn't carry a valid owner
+        zone_auth.  Returns 5xx if PeerTube is unreachable, rejects
+        our credentials, or returns a malformed /users/me response.
 
         Authorisation here is the zone_auth JWT verified inside
         this method via ``_verify_owner``.  ``_dispatch`` routes
@@ -1166,11 +1186,13 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
 
         # Fetch user-identity fields (id/username/email/role) from
         # /users/me so the trampoline can prime the SPA's
-        # localStorage with everything ``loadUser`` needs.  Without
-        # these the SPA boots as anonymous even with valid tokens
-        # (the SPA's ``loadUser`` short-circuits when ``M.USERNAME``
-        # is missing from localStorage).  See bundle inspection
-        # results for the full storage-key list.
+        # localStorage with everything its bootstrap needs.  Without
+        # these the SPA boots as anonymous even with valid tokens:
+        # the bootstrap calls ``loadUser`` in the upstream
+        # ``main.ts``, which calls ``getLoggedInUser`` in
+        # ``client/src/root-helpers/users/user-local-storage-keys.ts``,
+        # which returns null (and skips ``buildAuthUser``) whenever
+        # the ``username`` localStorage key is absent.
         try:
             me = self.oauth_bridge.fetch_user_info(
                 access_token=tokens["access_token"],
