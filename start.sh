@@ -853,13 +853,17 @@ _pt_curl() {
     fi
     curl_args+=("$url")
 
-    local raw status
+    # Capture the substitution exit status without ``set -e``
+    # killing the script before our explicit FATAL-log path runs.
+    # Bash's ``set -e`` exits on a non-zero command substitution
+    # in a plain assignment; the ``|| status=$?`` idiom (with
+    # ``status`` initialised to 0) absorbs the failure into a
+    # variable while still letting us branch on it explicitly.
+    local raw status=0
     if [[ $# -ge 7 ]]; then
-        raw=$(printf '%s' "$body" | "${curl_args[@]}")
-        status=$?
+        raw=$(printf '%s' "$body" | "${curl_args[@]}") || status=$?
     else
-        raw=$("${curl_args[@]}")
-        status=$?
+        raw=$("${curl_args[@]}") || status=$?
     fi
     if [[ $status -ne 0 ]]; then
         log "FATAL: $label: curl transport failure (exit $status)"
