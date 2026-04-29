@@ -46,6 +46,13 @@
 // — the SPA renders a generic "couldn't sign you in" message there,
 // which is the same surface PeerTube shows for any external-auth
 // failure.
+//
+// The plugin also ships a tiny client-side companion (``client.js``)
+// that hooks ``action:auth-user.logged-out`` and re-trampolines
+// the owner browser back through the auto-login route on session
+// expiry, so the SPA's "Your authentication has expired, you need
+// to reconnect" toast is replaced with a silent re-login.  See
+// client.js for the full design.
 
 'use strict'
 

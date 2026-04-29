@@ -16,7 +16,14 @@
   "library": "./main.js",
   "staticDirs": {},
   "css": [],
-  "clientScripts": [],
+  "clientScripts": [
+    {
+      "script": "client.js",
+      "scopes": [
+        "common"
+      ]
+    }
+  ],
   "translations": {},
   "dependencies": {
     "jsonwebtoken": "9.0.2",

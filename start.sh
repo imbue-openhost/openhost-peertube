@@ -1001,31 +1001,45 @@ if [[ -z "$INSTALLED" ]]; then
     exit 1
 fi
 
+# Build the install/update request payload.  Both endpoints take
+# the same ``{path: <plugin-source-dir>}`` body; we pick which
+# endpoint to hit based on whether the plugin is already in the
+# DB (LOOKUP_BODY non-empty) or not.
+INSTALL_PAYLOAD=$(python3 -c 'import json,os; print(json.dumps({"path": os.environ["PLUGIN_DIR"]}))') || {
+    log "FATAL: plugins.install: failed to build request payload"
+    early_exit_teardown
+    exit 1
+}
+
+# We always either install (if absent) OR update (if present)
+# rather than skipping when present.  The update path is
+# necessary because ``pnpm add file:<path>`` is a hash-aware copy
+# — if the bundled plugin source changed (new client-side hooks,
+# a fixed bug in main.js, …) we need PeerTube to re-copy it into
+# its plugins/node_modules tree and re-register the plugin.
+# Skipping in that case would leave the running PeerTube on the
+# old plugin code while start.sh thinks deployment succeeded.
+#
+# Both endpoints accept the same payload shape and bump the
+# 5-minute timeout because pnpm reaches the npm registry to pull
+# the plugin's runtime deps.
 if [[ "$INSTALLED" == "yes" ]]; then
-    log "Plugin auth-openhost-sso already installed"
+    log "Updating plugin auth-openhost-sso from $PLUGIN_DIR"
+    PT_CURL_ENDPOINT="$PT_LOOPBACK/api/v1/plugins/update"
+    PT_CURL_LABEL="plugins.update"
 else
     log "Installing plugin auth-openhost-sso from $PLUGIN_DIR"
-    INSTALL_PAYLOAD=$(python3 -c 'import json,os; print(json.dumps({"path": os.environ["PLUGIN_DIR"]}))') || {
-        log "FATAL: plugins.install: failed to build request payload"
-        early_exit_teardown
-        exit 1
-    }
-    # Bump the per-call timeout: PeerTube installs plugins via
-    # ``pnpm add file:<path>``, which fetches the plugin's
-    # runtime deps (jsonwebtoken, jwks-rsa) from the npm
-    # registry.  Network round-trips to npm + pnpm's hash
-    # verification dominate the time; 5 minutes is a generous
-    # ceiling that still produces a clean FATAL log on a
-    # genuinely-stuck install instead of hanging boot
-    # indefinitely.
-    PT_CURL_MAX_TIME=300 pt_curl "plugins.install" POST "$PT_ACCESS_TOKEN" \
-        "$PT_LOOPBACK/api/v1/plugins/install" \
-        "200 204" \
-        "application/json" "$INSTALL_PAYLOAD" >/dev/null || {
-        early_exit_teardown
-        exit 1
-    }
+    PT_CURL_ENDPOINT="$PT_LOOPBACK/api/v1/plugins/install"
+    PT_CURL_LABEL="plugins.install"
 fi
+
+PT_CURL_MAX_TIME=300 pt_curl "$PT_CURL_LABEL" POST "$PT_ACCESS_TOKEN" \
+    "$PT_CURL_ENDPOINT" \
+    "200 204" \
+    "application/json" "$INSTALL_PAYLOAD" >/dev/null || {
+    early_exit_teardown
+    exit 1
+}
 
 # Always re-set the openhost-router-url setting.  PeerTube
 # accepts a JSON body of {settings: {<name>: <value>}} on

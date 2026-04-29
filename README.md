@@ -90,15 +90,28 @@ The flow:
    token triple and the four user-identity fields exactly the
    way a regular password login does — no plugin/sidecar gymnastics
    required to track the SPA's internal contract. The SPA then
-   navigates to the homepage with the owner logged in as `root`
+   navigates to the homepage with the owner logged in as `openhost`
    admin.
+
+**Auto-relogin on session expiry.** The plugin also ships a small
+client-side companion script that hooks
+`action:auth-user.logged-out` and silently re-trampolines the
+browser back through `/plugins/auth-openhost-sso/router/auto-login`
+when the SPA's auth state collapses. Without this, an owner whose
+OAuth refresh-token has aged out (or whose tokens were invalidated
+by a PeerTube restart) sees PeerTube's "Your authentication has
+expired, you need to reconnect" toast; with it, the SPA silently
+re-logs-in if the owner's `zone_auth` cookie is still valid.
+The same path falls through to `/login?externalAuthError=true`
+for non-owners, matching what the toast's "reconnect" link would
+have done.
 
 The end result: the owner clicks `https://peertube.<your-zone>`
 from the OpenHost dashboard and lands directly in the PeerTube
-admin UI, already logged in as `root`. No password prompt. The
-PeerTube mobile app and other third-party clients still work via
-the regular username + `admin-password.txt` flow — they get a
-plain password login form because they don't carry `zone_auth`.
+admin UI, already logged in as `openhost`. No password prompt.
+The PeerTube mobile app and other third-party clients still work
+via the regular username + `admin-password.txt` flow — they get
+a plain password login form because they don't carry `zone_auth`.
 
 **Single user.** This package is designed for the typical "personal
 PeerTube instance" deployment shape (~20% of all real-world PeerTube
