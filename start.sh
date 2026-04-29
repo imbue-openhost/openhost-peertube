@@ -1003,10 +1003,10 @@ fi
 
 # Build the install/update request payload.  Both endpoints take
 # the same ``{path: <plugin-source-dir>}`` body; we pick which
-# endpoint to hit based on whether the plugin is already in the
-# DB (LOOKUP_BODY non-empty) or not.
+# endpoint to hit based on the ``INSTALLED`` variable computed
+# above (yes => the plugin is in the DB, no => it isn't).
 INSTALL_PAYLOAD=$(python3 -c 'import json,os; print(json.dumps({"path": os.environ["PLUGIN_DIR"]}))') || {
-    log "FATAL: plugins.install: failed to build request payload"
+    log "FATAL: plugins.install/update: failed to build request payload"
     early_exit_teardown
     exit 1
 }

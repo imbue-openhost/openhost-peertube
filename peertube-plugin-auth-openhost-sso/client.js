@@ -16,10 +16,14 @@
 // path inside the AuthService) and redirect the browser to the
 // plugin's auto-login route.  The SSO plugin handler verifies the
 // zone_auth JWT against the cached JWKS:
-//   * valid owner → ``userAuthenticated`` → /login?externalAuthToken=…
-//                    → SPA's standard login flow takes over
-//   * no/invalid cookie → /login?externalAuthError=true (same place
-//                    the toast's "reconnect" would lead).
+//   * valid owner       → ``userAuthenticated`` →
+//                          /login?externalAuthToken=… → SPA's
+//                          standard login flow takes over
+//   * no zone_auth      → /login (visitor sees the standard
+//                          PeerTube login form)
+//   * invalid zone_auth → /login?externalAuthError=true (same
+//                          surface the toast's "reconnect" link
+//                          would have led to).
 //
 // Explicit-logout caveat: this hook can't tell user-initiated
 // logout apart from refresh-failure logout — the SPA exposes the
