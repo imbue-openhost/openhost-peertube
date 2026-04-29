@@ -961,79 +961,40 @@ PT_ACCESS_TOKEN=$(printf '%s' "$TOKEN_JSON" | parse_json_field users.token acces
     exit 1
 }
 
-# Check whether the plugin is already installed.  The
-# single-resource lookup ``GET /api/v1/plugins/<npmName>``
-# returns 200 with the plugin's metadata if installed, or 404
-# otherwise — avoids paginating the full plugin list (which
-# could miss us on an instance with hundreds of installed
-# plugins) AND lets us decide install-or-skip from a single
-# request.
+# Push the bundled plugin source into PeerTube on every boot.
+# We use the ``install`` endpoint unconditionally — it accepts a
+# ``{path: <plugin-source-dir>}`` body, calls ``pnpm add
+# file:<path>`` to copy the plugin into PeerTube's
+# plugins/node_modules tree (overwriting any previous copy),
+# upserts the plugin row in PeerTube's DB with ``uninstalled:
+# false``, and re-registers the plugin in memory.  Idempotent
+# in the install-vs-already-installed sense; also self-heals
+# the case where the persistent plugins/ dir was wiped while
+# the DB row was preserved (PeerTube would otherwise refuse to
+# register the plugin at boot due to the missing package.json,
+# leaving the in-memory state out of sync with the DB — an
+# ``install`` re-copies the files and re-registers).
 #
-# We accept both 200 and 404 as "not a fatal error".  The body
-# shape disambiguates: PeerTube's plugin object always carries
-# a non-empty ``name`` field, so the presence of that field in
-# a successfully parsed JSON object is the marker for
-# "installed".  An error response (404) is also valid JSON
-# (``{error: ...}``) which lacks ``name``.
-LOOKUP_BODY=$(pt_curl "plugins.lookup" GET "$PT_ACCESS_TOKEN" \
-    "$PT_LOOPBACK/api/v1/plugins/$PLUGIN_NPM_NAME" \
-    "200 404") || {
-    early_exit_teardown
-    exit 1
-}
-INSTALLED=""
-INSTALLED=$(printf '%s' "$LOOKUP_BODY" | python3 -c '
-import json, sys
-try:
-    data = json.load(sys.stdin)
-except json.JSONDecodeError:
-    print("no")
-    sys.exit(0)
-print("yes" if isinstance(data, dict) and data.get("name") else "no")
-') || {
-    log "FATAL: plugins.lookup: install-state probe crashed"
-    early_exit_teardown
-    exit 1
-}
-if [[ -z "$INSTALLED" ]]; then
-    log "FATAL: plugins.lookup: install-state probe produced empty output"
-    early_exit_teardown
-    exit 1
-fi
-
-# Build the install/update request payload.  Both endpoints take
-# the same ``{path: <plugin-source-dir>}`` body; we pick which
-# endpoint to hit based on the ``INSTALLED`` variable computed
-# above (yes => the plugin is in the DB, no => it isn't).
+# We deliberately don't use ``/api/v1/plugins/update``: that
+# endpoint requires the plugin to be currently registered in
+# memory, which fails after a plugins/ dir wipe.  ``install``
+# has the same effect (re-copy + re-register) and works from
+# any starting state.
 INSTALL_PAYLOAD=$(python3 -c 'import json,os; print(json.dumps({"path": os.environ["PLUGIN_DIR"]}))') || {
-    log "FATAL: plugins.install/update: failed to build request payload"
+    log "FATAL: plugins.install: failed to build request payload"
     early_exit_teardown
     exit 1
 }
 
-# Every boot pushes the bundled plugin source into PeerTube via
-# install (when absent) or update (when present).  Both endpoints
-# eventually call ``pnpm add file:<path>``, which copies the
-# plugin into PeerTube's plugins/node_modules tree and triggers
-# re-registration — this is the path by which any change to the
-# bundled main.js, client.js, or package.json takes effect on a
-# running instance.
-#
-# Both endpoints accept the same payload shape and bump the
-# 5-minute timeout because pnpm reaches the npm registry to pull
-# the plugin's runtime deps.
-if [[ "$INSTALLED" == "yes" ]]; then
-    log "Updating plugin auth-openhost-sso from $PLUGIN_DIR"
-    PT_CURL_ENDPOINT="$PT_LOOPBACK/api/v1/plugins/update"
-    PT_CURL_LABEL="plugins.update"
-else
-    log "Installing plugin auth-openhost-sso from $PLUGIN_DIR"
-    PT_CURL_ENDPOINT="$PT_LOOPBACK/api/v1/plugins/install"
-    PT_CURL_LABEL="plugins.install"
-fi
-
-PT_CURL_MAX_TIME=300 pt_curl "$PT_CURL_LABEL" POST "$PT_ACCESS_TOKEN" \
-    "$PT_CURL_ENDPOINT" \
+log "Installing plugin auth-openhost-sso from $PLUGIN_DIR"
+# Bump the per-call timeout: pnpm reaches the npm registry to
+# pull the plugin's runtime deps (jsonwebtoken, jwks-rsa,
+# jwk-to-pem).  Network round-trips + pnpm's hash verification
+# dominate the time; 5 minutes is a generous ceiling that still
+# produces a clean FATAL log on a genuinely-stuck install
+# instead of hanging boot indefinitely.
+PT_CURL_MAX_TIME=300 pt_curl "plugins.install" POST "$PT_ACCESS_TOKEN" \
+    "$PT_LOOPBACK/api/v1/plugins/install" \
     "200 204" \
     "application/json" "$INSTALL_PAYLOAD" >/dev/null || {
     early_exit_teardown
