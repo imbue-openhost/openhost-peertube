@@ -46,12 +46,13 @@ const AUTO_LOGIN_PATH = '/plugins/auth-openhost-sso/router/auto-login'
 //                 (if SSO still fails) or steal focus from a manual
 //                 re-login attempt.
 //   * /signup   — same reasoning.
-//   * /admin/...— explicit admin views; reaching them requires
-//                 admin auth, so a logout there indicates session
-//                 expiry, but redirecting from inside the admin
-//                 routing tree confuses the Angular router.  Better
-//                 to let the SPA finish its internal logout, then
-//                 trigger the bounce on the next plain navigation.
+//   * /plugins/.../auth/...
+//   * /plugins/.../router/...
+//                 the auto-login route itself; we'd loop.  We use
+//                 a broad ``/plugins/`` prefix because the plugin
+//                 mount points (``/plugins/<name>/router/<route>``
+//                 and ``/plugins/<name>/<version>/auth/<authName>``)
+//                 are both under that tree.
 function shouldSkipAutoRelogin () {
   const path = window.location.pathname || '/'
   if (path === '/login' || path.startsWith('/login/')) return true

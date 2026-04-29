@@ -1011,14 +1011,13 @@ INSTALL_PAYLOAD=$(python3 -c 'import json,os; print(json.dumps({"path": os.envir
     exit 1
 }
 
-# We always either install (if absent) OR update (if present)
-# rather than skipping when present.  The update path is
-# necessary because ``pnpm add file:<path>`` is a hash-aware copy
-# — if the bundled plugin source changed (new client-side hooks,
-# a fixed bug in main.js, …) we need PeerTube to re-copy it into
-# its plugins/node_modules tree and re-register the plugin.
-# Skipping in that case would leave the running PeerTube on the
-# old plugin code while start.sh thinks deployment succeeded.
+# Every boot pushes the bundled plugin source into PeerTube via
+# install (when absent) or update (when present).  Both endpoints
+# eventually call ``pnpm add file:<path>``, which copies the
+# plugin into PeerTube's plugins/node_modules tree and triggers
+# re-registration — this is the path by which any change to the
+# bundled main.js, client.js, or package.json takes effect on a
+# running instance.
 #
 # Both endpoints accept the same payload shape and bump the
 # 5-minute timeout because pnpm reaches the npm registry to pull
