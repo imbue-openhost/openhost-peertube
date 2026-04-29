@@ -102,9 +102,10 @@ OAuth refresh-token has aged out (or whose tokens were invalidated
 by a PeerTube restart) sees PeerTube's "Your authentication has
 expired, you need to reconnect" toast; with it, the SPA silently
 re-logs-in if the owner's `zone_auth` cookie is still valid.
-The same path falls through to `/login?externalAuthError=true`
-for non-owners, matching what the toast's "reconnect" link would
-have done.
+A non-owner whose session expired falls through to plain `/login`
+(if their `zone_auth` is absent) or to `/login?externalAuthError=true`
+(if it's present but fails JWT verification) — matching what the
+toast's "reconnect" link would have done.
 
 The end result: the owner clicks `https://peertube.<your-zone>`
 from the OpenHost dashboard and lands directly in the PeerTube
