@@ -38,9 +38,16 @@ public_paths = ["/"]
 #   * redis    ~80  MiB  (maxmemory 256 MB cap, idle around 80)
 #   * peertube ~600 MiB  (node 22 + queue workers)
 #   * ffmpeg   spikes during transcode jobs
-# 2 GiB is enough for a small instance with light transcoding;
-# bump for heavy use.
-memory_mb = 2048
+# 4 GiB headroom: ~1 GiB baseline above + ~3 GiB for ffmpeg.
+# 4K (2160p) AV1 -> h264 transcoding under fluent-ffmpeg with
+# libdav1d decode + libx264 encode + a 1024-frame muxing queue
+# easily peaks above 1.5 GiB resident, and an earlier 2 GiB cap
+# tripped the cgroup OOM-killer mid-encode (SIGKILL with no
+# ffmpeg-internal error) within seconds of the worker starting
+# the optimize-job for a 4K upload.  3 GiB of ffmpeg headroom
+# also covers concurrent HLS resolution rungs that PeerTube
+# enqueues after the optimize step.
+memory_mb = 4096
 # Transcoding is CPU-bound. 2000m allows two parallel ffmpeg
 # encoding threads without starving the node event loop.
 cpu_millicores = 2000
