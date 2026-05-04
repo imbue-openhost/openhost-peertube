@@ -97,21 +97,29 @@
 	# order, first matching wins.
 	@oauth_client path /api/v1/oauth-clients/local
 	handle @oauth_client {
-		# Set the no-store header on the response we send to
-		# the client, regardless of what PeerTube returned.
-		# ``defer`` ensures the directive runs AFTER the
-		# upstream's response headers are merged in, so we
-		# clobber any upstream Cache-Control / Pragma rather
-		# than getting clobbered ourselves.  PeerTube
-		# currently emits neither (just an ETag), so the
-		# override is belt-and-suspenders.
-		header Cache-Control "no-store" defer
-		header Pragma "no-cache" defer
-		# Strip the ETag too — without it the browser can't
-		# even attempt a conditional 304 round-trip.  Without
-		# this strip, an old browser cache + a fresh ETag
-		# match would still let the SPA reuse a stale body.
-		header -ETag defer
+		# Force-set the response headers regardless of what
+		# PeerTube returns.  ``defer`` runs after the
+		# upstream's response headers are merged so we clobber
+		# any upstream Cache-Control / Pragma rather than
+		# getting clobbered.  PeerTube currently emits neither
+		# (just an ETag), so the overrides are belt-and-
+		# suspenders, but the ETag strip IS necessary —
+		# otherwise an old browser cache + a fresh ETag match
+		# would let the SPA reuse a stale body even though
+		# Cache-Control would have prevented the cache.
+		#
+		# The block form (``header { ... }``) is the only way
+		# in Caddy v2's Caddyfile to attach ``defer`` to a
+		# group of header directives.  Bare ``header Foo bar
+		# defer`` would be parsed as a four-arg replace
+		# (matcher / field / search-regex / replacement), not
+		# as a deferred set.
+		header {
+			Cache-Control "no-store"
+			Pragma "no-cache"
+			-ETag
+			defer
+		}
 		# Same proxy body as the other handlers below — kept
 		# duplicated rather than DRYed via a snippet because
 		# Caddy's snippet evaluation order interacts oddly
