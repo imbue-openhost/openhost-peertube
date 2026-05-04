@@ -127,7 +127,11 @@
 		request_header Host {header.X-Forwarded-Host}
 		reverse_proxy 127.0.0.1:9001 {
 			header_up X-Forwarded-For    {header.X-Forwarded-For}
-			header_up X-Forwarded-Proto  {header.X-Forwarded-Proto}
+			# X-Forwarded-Proto: see the comment block on the
+			# default handler below for why we force ``https``
+			# here rather than passing through the inbound
+			# header.
+			header_up X-Forwarded-Proto  https
 			header_up X-Forwarded-Host   {header.X-Forwarded-Host}
 		}
 	}
@@ -151,7 +155,33 @@
 			# router's value with Caddy's view of the client
 			# IP (127.0.0.1, the router itself).
 			header_up X-Forwarded-For    {header.X-Forwarded-For}
-			header_up X-Forwarded-Proto  {header.X-Forwarded-Proto}
+			# X-Forwarded-Proto is force-set to ``https``
+			# rather than passed through.  Background: the
+			# OpenHost router (compute_space) runs hypercorn
+			# without ProxyFixMiddleware, so it sees the
+			# inbound connection from the public Caddy
+			# (loopback, plain HTTP) as scheme=http and
+			# overwrites X-Forwarded-Proto with ``http``
+			# before forwarding to us — even when the
+			# original browser request was HTTPS.  PeerTube's
+			# resumable-upload library (@uploadx/core) reads
+			# X-Forwarded-Proto verbatim to construct the
+			# absolute Location header it returns to the
+			# browser, so an inbound ``http`` produces a
+			# ``http://...`` upload URL on a HTTPS page —
+			# which the browser blocks as Mixed Content,
+			# making video uploads fail with an opaque
+			# "Unknown error".  Forcing ``https`` here is
+			# safe: this Caddy is loopback-only, only the
+			# auth-proxy talks to it, the auth-proxy only
+			# accepts requests forwarded by the OpenHost
+			# router, and the OpenHost router only listens
+			# behind the public TLS-terminating Caddy on
+			# :443.  HTTP cannot reach this socket.  The
+			# correct long-term fix is to wire ProxyFix into
+			# compute_space; this is a tactical workaround
+			# pending that change.
+			header_up X-Forwarded-Proto  https
 			header_up X-Forwarded-Host   {header.X-Forwarded-Host}
 			# WebSocket upgrade handling is automatic in
 			# reverse_proxy; PeerTube uses ws for live
@@ -159,6 +189,16 @@
 		}
 	}
 	handle {
-		reverse_proxy 127.0.0.1:9001
+		# Fallback path — fires only if X-Forwarded-Host is
+		# missing, which shouldn't happen on a real deploy
+		# (the OpenHost router always stamps it).  Still set
+		# X-Forwarded-Proto: https for the same reason as the
+		# main handler above; otherwise Caddy's default would
+		# stamp ``http`` (the listener scheme on this loopback
+		# socket) and we'd be back to the Mixed Content
+		# upload bug on this codepath.
+		reverse_proxy 127.0.0.1:9001 {
+			header_up X-Forwarded-Proto https
+		}
 	}
 }
