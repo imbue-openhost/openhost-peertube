@@ -70,16 +70,69 @@
 # our inbound traffic carries Host: 127.0.0.1:9090 (with the port).
 :9090 {
 	bind 127.0.0.1
-	# Rewrite the Host header from X-Forwarded-Host before
-	# proxying to PeerTube on its loopback port. If the header
-	# is absent (which would only happen if something other
-	# than the OpenHost router talked to us — there shouldn't
-	# be such a path on a real deploy), fall through to
-	# whatever Host the client sent.
+
+	# /api/v1/oauth-clients/local hands the SPA the random
+	# clientId/clientSecret pair PeerTube generates on first
+	# boot.  PeerTube's response carries an ETag but no
+	# ``Cache-Control`` header, so browsers cache the body
+	# indefinitely and revalidate via If-None-Match on the
+	# next visit.  In normal operation that's harmless, but
+	# our deploy lifecycle can rotate the underlying
+	# ``oAuthClient`` row (e.g. if an operator wipes app data
+	# and redeploys, or the package gets reinstalled with
+	# fresh secrets), and any browser whose cache predates
+	# the rotation will go on POSTing the OLD client_id /
+	# client_secret pair to /api/v1/users/token, where
+	# PeerTube responds with the cryptic ``Invalid client:
+	# client is invalid`` and the SPA's login flow dead-ends
+	# until the operator clears site data.
 	#
-	# Caddy's `request_header Host {header.X-Forwarded-Host}`
-	# rewrites the header on the request that gets forwarded
-	# to the backend, NOT the response.
+	# Adding ``Cache-Control: no-store`` makes the SPA always
+	# re-fetch the live values, turning the rotation case
+	# from "permanent login failure" into "one extra GET on
+	# next page load."  The endpoint is hit at most once per
+	# SPA session, so the cost of disabling caching is
+	# essentially zero.  This handler MUST come before the
+	# ``@has_xfh`` block below — Caddy evaluates handlers in
+	# order, first matching wins.
+	@oauth_client path /api/v1/oauth-clients/local
+	handle @oauth_client {
+		# Set the no-store header on the response we send to
+		# the client, regardless of what PeerTube returned.
+		# ``defer`` ensures the directive runs AFTER the
+		# upstream's response headers are merged in, so we
+		# clobber any upstream Cache-Control / Pragma rather
+		# than getting clobbered ourselves.  PeerTube
+		# currently emits neither (just an ETag), so the
+		# override is belt-and-suspenders.
+		header Cache-Control "no-store" defer
+		header Pragma "no-cache" defer
+		# Strip the ETag too — without it the browser can't
+		# even attempt a conditional 304 round-trip.  Without
+		# this strip, an old browser cache + a fresh ETag
+		# match would still let the SPA reuse a stale body.
+		header -ETag defer
+		# Same proxy body as the other handlers below — kept
+		# duplicated rather than DRYed via a snippet because
+		# Caddy's snippet evaluation order interacts oddly
+		# with header directives across handlers.
+		request_header Host {header.X-Forwarded-Host}
+		reverse_proxy 127.0.0.1:9001 {
+			header_up X-Forwarded-For    {header.X-Forwarded-For}
+			header_up X-Forwarded-Proto  {header.X-Forwarded-Proto}
+			header_up X-Forwarded-Host   {header.X-Forwarded-Host}
+		}
+	}
+
+	# Default handler chain for every other request.  Rewrites
+	# the Host header from X-Forwarded-Host before proxying to
+	# PeerTube on its loopback port.  If the header is absent
+	# (which would only happen if something other than the
+	# OpenHost router talked to us — there shouldn't be such
+	# a path on a real deploy), fall through to whatever Host
+	# the client sent.  ``request_header Host
+	# {header.X-Forwarded-Host}`` rewrites the header on the
+	# REQUEST forwarded to the backend, not the response.
 	@has_xfh header X-Forwarded-Host *
 	handle @has_xfh {
 		request_header Host {header.X-Forwarded-Host}
